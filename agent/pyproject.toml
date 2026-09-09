@@ -24,3 +24,5 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Bare `pytest` (as CI runs it) must import osir_agent from this directory.
+pythonpath = ["."]
