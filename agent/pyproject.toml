@@ -1,0 +1,26 @@
+[project]
+name = "osir-agent"
+version = "0.1.0"
+description = "Osir AI autopilot: a Strands agent that runs a social-media workspace in the background and only surfaces real decisions."
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "strands-agents>=1.55,<2",
+    "mcp>=1.0,<2",
+    "bedrock-agentcore>=1.22,<2",
+    "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

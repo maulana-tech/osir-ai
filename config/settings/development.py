@@ -1,0 +1,43 @@
+import os as _os
+
+from .base import *  # noqa: F401, F403
+
+DEBUG = True
+ALLOWED_HOSTS = ["*"]
+
+# CSRF trust for HTTPS tunnels (ngrok, cloudflared, etc.). Django requires the
+# request Origin / Referer host to be explicitly trusted for any POST coming
+# through a non-localhost hostname, even with DEBUG=True.
+# Comma-separated, e.g. "https://foo.ngrok-free.app,https://bar".
+_extra = _os.environ.get("CSRF_TRUSTED_ORIGINS", "").strip()
+if _extra:
+    CSRF_TRUSTED_ORIGINS = [o.strip() for o in _extra.split(",") if o.strip()]
+
+# Tunnel-aware redirect handling. ngrok terminates TLS and forwards plain
+# HTTP to runserver; without this Django treats requests as http:// and
+# Stripe's success URL redirect → activate view would build wrong scheme.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
+
+# Plain storage in dev — no manifest needed, runserver uses finders directly.
+STORAGES["staticfiles"] = {  # noqa: F405
+    "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+}
+
+# Use console email backend in development
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+
+# Disable CSP in development
+CSP_REPORT_ONLY = True
+
+# Django debug toolbar (optional)
+try:
+    import debug_toolbar  # noqa: F401
+
+    INSTALLED_APPS += ["debug_toolbar"]  # noqa: F405
+    MIDDLEWARE.insert(0, "debug_toolbar.middleware.DebugToolbarMiddleware")  # noqa: F405
+    INTERNAL_IPS = ["127.0.0.1"]
+except ImportError:
+    pass
+
+SESSION_COOKIE_SECURE = False

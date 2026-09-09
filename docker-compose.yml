@@ -1,0 +1,90 @@
+services:
+  migrate:
+    build: .
+    command: python manage.py migrate --noinput
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: .
+    volumes:
+      - media_data:/app/media
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8000/health/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python manage.py process_tasks
+    volumes:
+      - media_data:/app/media
+    env_file:
+      - .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Osir Console (web/): the human side of the autopilot. Needs STUDIO_API_KEY in .env.
+  console:
+    build: ./web
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - STUDIO_URL=http://app:8000
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Local runner for console commands when the agent is not on AgentCore.
+  # Needs STUDIO_API_KEY plus AWS credentials (Bedrock) in .env:
+  #   docker compose --profile agent up -d
+  agent-worker:
+    build: ./agent
+    profiles: ["agent"]
+    command: python run_local.py worker
+    env_file:
+      - .env
+    environment:
+      - STUDIO_URL=http://app:8000
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: osir_ai
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  media_data:

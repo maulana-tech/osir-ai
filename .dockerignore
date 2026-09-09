@@ -1,0 +1,20 @@
+# Local environments and build output never belong in the Studio image.
+.venv
+venv
+agent/.venv
+web/node_modules
+web/.next
+theme/static_src/node_modules
+staticfiles
+media
+test_media
+.git
+.github
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+*.pyc

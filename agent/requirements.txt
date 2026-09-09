@@ -1,0 +1,4 @@
+strands-agents>=1.55,<2
+mcp>=1.0,<2
+bedrock-agentcore>=1.22,<2
+pydantic>=2.7,<3

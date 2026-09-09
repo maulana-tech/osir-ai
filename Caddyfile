@@ -1,0 +1,9 @@
+{$APP_DOMAIN:localhost} {
+    reverse_proxy app:8000
+    encode gzip
+}
+
+{$CONSOLE_DOMAIN:console.localhost} {
+    reverse_proxy console:3000
+    encode gzip
+}
