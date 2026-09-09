@@ -26,7 +26,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         </div>
         {run.instruction && <p className="mt-3 whitespace-pre-wrap text-sm">“{run.instruction}”</p>}
         {run.error && (
-          <pre className="mt-3 overflow-x-auto rounded-lg p-3 text-xs" style={{ color: "var(--bad)", background: "#160f0f" }}>
+          <pre className="mt-3 overflow-x-auto rounded-lg p-3 text-xs" style={{ color: "var(--bad)", background: "#fef2f2" }}>
             {run.error}
           </pre>
         )}
