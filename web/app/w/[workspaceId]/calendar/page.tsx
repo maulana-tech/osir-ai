@@ -44,7 +44,7 @@ export default async function Publish({ params, searchParams }: { params: Promis
             <Link className="btn" href={`/w/${workspaceId}/calendar`}>
               calendar
             </Link>
-            <a href={`/workspace/${workspaceId}/compose/`} className="btn btn-accent">
+            <a href={`/w/${workspaceId}/compose`} className="btn btn-accent">
               New post
             </a>
           </div>
@@ -75,7 +75,7 @@ export default async function Publish({ params, searchParams }: { params: Promis
                     {p.title && <div className="mt-1 text-sm font-semibold">{p.title}</div>}
                     <p className="mt-1 line-clamp-3 whitespace-pre-wrap text-sm">{p.caption}</p>
                   </div>
-                  <a href={`/workspace/${workspaceId}/compose/${p.id}/`} className="btn shrink-0">
+                  <a href={`/w/${workspaceId}/compose/${p.id}`} className="btn shrink-0">
                     Open
                   </a>
                 </li>
@@ -93,7 +93,7 @@ export default async function Publish({ params, searchParams }: { params: Promis
   return (
     <div>
       <PageHeader title="Publish">
-        <a href={`/workspace/${workspaceId}/compose/`} className="btn btn-accent">
+        <a href={`/w/${workspaceId}/compose`} className="btn btn-accent">
           New post
         </a>
       </PageHeader>

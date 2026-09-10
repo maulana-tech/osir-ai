@@ -213,7 +213,7 @@ function Card({ p, workspaceId, userId, selected, onSelect }: { p: Post; workspa
               <button className="underline" style={{ color: "var(--muted)" }} onClick={() => setPanel(panel === "versions" ? null : "versions")}>
                 Versions
               </button>
-              <a className="underline" style={{ color: "var(--muted)" }} href={`/workspace/${workspaceId}/composer/${p.id}/edit/`}>
+              <a className="underline" style={{ color: "var(--muted)" }} href={`/w/${workspaceId}/compose/${p.id}`}>
                 Edit
               </a>
             </span>

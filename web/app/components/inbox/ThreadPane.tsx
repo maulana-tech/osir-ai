@@ -59,7 +59,7 @@ export function ThreadPane({
           <span>{message.account.name}</span>
           <span>· {new Date(message.received_at).toLocaleString()}</span>
           {message.related_post && (
-            <a href={`/workspace/${workspaceId}/compose/${message.related_post.id}/`} className="hover:text-black">
+            <a href={`/w/${workspaceId}/compose/${message.related_post.id}`} className="hover:text-black">
               on your post “{message.related_post.caption.slice(0, 40)}…”
             </a>
           )}

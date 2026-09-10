@@ -63,8 +63,8 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
   const step = (n: number) => (view === "month" ? addMonths(date, n) : addDays(date, view === "week" ? 7 * n : n));
   const composeUrl = (slot?: OpenSlot) =>
     slot
-      ? `/workspace/${workspaceId}/compose/?scheduled_date=${slot.compose_date}&scheduled_time=${slot.compose_time}&account=${slot.account.id}`
-      : `/workspace/${workspaceId}/compose/`;
+      ? `/w/${workspaceId}/compose?scheduled_date=${slot.compose_date}&scheduled_time=${slot.compose_time}&account=${slot.account.id}`
+      : `/w/${workspaceId}/compose`;
 
   // Index chips and slots by display-tz day (and hour for week/day views).
   const byDay = new Map<string, Chip[]>();
@@ -116,7 +116,7 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
     const l = c.at ? toLocal(c.at, tz) : null;
     return (
       <a
-        href={`/workspace/${workspaceId}/compose/${c.post_id}/`}
+        href={`/w/${workspaceId}/compose/${c.post_id}`}
         draggable={c.is_reschedulable}
         onDragStart={(e) => e.dataTransfer.setData("text/chip", c.id)}
         title={`${c.account.name} · ${c.status}${c.publish_error ? `\n${c.publish_error}` : ""}`}
@@ -335,7 +335,7 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
               <ul className="space-y-1">
                 {data.unscheduled_drafts.map((d) => (
                   <li key={d.id}>
-                    <a href={`/workspace/${workspaceId}/compose/${d.id}/`} className="block truncate rounded px-1.5 py-1 text-xs hover:bg-neutral-100">
+                    <a href={`/w/${workspaceId}/compose/${d.id}`} className="block truncate rounded px-1.5 py-1 text-xs hover:bg-neutral-100">
                       {d.title || d.caption || "(empty draft)"}
                     </a>
                   </li>

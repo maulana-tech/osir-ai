@@ -7,7 +7,7 @@ import type { Checklist as ChecklistData } from "@/lib/types.admin";
 
 const LINKS: Record<string, (ws: string) => string> = {
   connect_account: (ws) => `/w/${ws}/channels`,
-  create_post: (ws) => `/workspace/${ws}/composer/new/`,
+  create_post: (ws) => `/w/${ws}/compose`,
   schedule_post: (ws) => `/w/${ws}/calendar`,
   invite_member: () => "/org/members",
   set_timezone: (ws) => `/w/${ws}/settings`,

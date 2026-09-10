@@ -59,6 +59,7 @@ export function Sidebar({ me, workspace, sidebar }: { me: Me; workspace: Workspa
       <nav className="flex-1 space-y-6 overflow-y-auto px-3 text-sm">
         <div className="space-y-0.5">
           <NavLink href={`${base}/calendar`}>Publish</NavLink>
+          {can("create_posts") && <NavLink href={`${base}/create`}>Create</NavLink>}
           {can("use_inbox") && (
             <NavLink href={`${base}/inbox`}>
               Social Inbox <Badge n={sidebar.unread_inbox_count} />
@@ -117,6 +118,7 @@ export function Sidebar({ me, workspace, sidebar }: { me: Me; workspace: Workspa
 
         <Group title="Settings">
           {can("manage_workspace_settings") && <NavLink href={`${base}/settings`}>Workspace</NavLink>}
+          {can("create_posts") && <NavLink href={`${base}/categories`}>Categories</NavLink>}
           {me.organization && (
             <>
               {orgAdmin && <NavLink href="/org/settings">Organization</NavLink>}
