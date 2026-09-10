@@ -115,7 +115,7 @@ class UnsplashSearchTests(ComposerTestCase):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 400)
 
-    @patch("apps.composer.views.httpx.get")
+    @patch("apps.composer.unsplash.httpx.get")
     def test_results_trimmed_to_ui_fields(self, mock_get):
         mock_get.return_value = _response(
             json_data={
@@ -175,13 +175,13 @@ class UnsplashSearchTests(ComposerTestCase):
         headers = mock_get.call_args.kwargs["headers"]
         self.assertEqual(headers["Authorization"], "Client-ID test-key")
 
-    @patch("apps.composer.views.httpx.get")
+    @patch("apps.composer.unsplash.httpx.get")
     def test_rate_limit_maps_to_429(self, mock_get):
         mock_get.return_value = _response(status_code=429)
         response = self.client.get(self.url, {"q": "coffee"})
         self.assertEqual(response.status_code, 429)
 
-    @patch("apps.composer.views.httpx.get")
+    @patch("apps.composer.unsplash.httpx.get")
     def test_non_object_body_maps_to_502(self, mock_get):
         # A 200 whose JSON top level is a list/null/scalar must not 500 on
         # data.get(). (Build the mock directly so the _response helper's
@@ -219,7 +219,7 @@ class UnsplashImportTests(ComposerTestCase):
         client.__exit__ = MagicMock(return_value=False)
         client.get = MagicMock(side_effect=list(get_side_effect))
         client.stream = MagicMock(side_effect=list(stream_side_effect))
-        return patch("apps.composer.views.httpx.Client", return_value=client), client
+        return patch("apps.composer.unsplash.httpx.Client", return_value=client), client
 
     def _stream_cm(self, *, status_code=200, content=b"jpeg-bytes", content_type="image/jpeg", content_length=None):
         resp = MagicMock()

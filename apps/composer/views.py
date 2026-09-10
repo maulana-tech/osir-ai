@@ -5,51 +5,39 @@ import contextlib
 import json
 import re
 import uuid
-from datetime import UTC, datetime
-from urllib.parse import urljoin
+from datetime import datetime
 
-import httpx
-from dateutil import parser as date_parser
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
-from django.core.cache import cache
-from django.core.exceptions import PermissionDenied, SuspiciousOperation, ValidationError
+from django.core.exceptions import PermissionDenied, SuspiciousOperation
 from django.db import models, transaction
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.utils import timezone
-from django.utils.html import strip_tags
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.common.validators import (
-    is_safe_url,
     parse_and_truncate_tag_string,
-    parse_and_truncate_youtube_tag_string,
-    safe_xml_fromstring,
 )
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
-from providers.tiktok import VALID_PRIVACY_LEVELS as TIKTOK_PRIVACY_LEVELS
 
+from . import csv_import, editor, feeds, ideas, platform_info, unsplash
 from .forms import ContentCategoryForm, PostForm
 from .models import (
     ContentCategory,
     Feed,
     Idea,
     IdeaGroup,
-    IdeaMedia,
     PlatformPost,
     Post,
     PostMedia,
     PostTemplate,
-    PostVersion,
     Tag,
 )
-
-MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
 
 # Shown when every posting slot within the lookahead horizon is already taken.
 _QUEUE_FULL_MSG = "No open posting slot within the scheduling horizon — add posting slots or free one up."
@@ -100,258 +88,6 @@ def _get_account_scope(request):
     if not _is_valid_uuid(scope):
         raise SuspiciousOperation("Malformed account_scope.")
     return scope
-
-
-def _remove_deselected_platform_posts(request, post, selected_ids):
-    """Delete PlatformPosts the user deselected in the composer form.
-
-    When the composer was opened scoped to a single account
-    (``?account=`` → hidden ``account_scope`` input), the form only renders
-    that account, so ``selected_ids`` is NOT the complete desired set —
-    restrict deletion to the scoped account to keep siblings intact.
-    Published/publishing rows are never deleted by deselection (explicit
-    post deletion remains the user's call — see PlatformPost.PROTECTED_STATUSES).
-    """
-    qs = post.platform_posts.exclude(social_account_id__in=selected_ids)
-    scope = _get_account_scope(request)
-    if scope:
-        qs = qs.filter(social_account_id=scope)
-    qs.exclude(status__in=PlatformPost.PROTECTED_STATUSES).delete()
-
-
-def _scoped_platform_post_ids(request, post):
-    """PlatformPost IDs inside the composer's ``account_scope``, or ``None`` when unscoped."""
-    scope = _get_account_scope(request)
-    if not scope:
-        return None
-    return list(post.platform_posts.filter(social_account_id=scope).values_list("id", flat=True))
-
-
-def _sync_platform_posts(request, post, workspace, initial_status=None):
-    """Sync platform post selections from form data.
-
-    When ``initial_status`` is given, newly-created PlatformPost rows are
-    initialised to that status (e.g. ``"draft"``, ``"scheduled"``,
-    ``"pending_review"``). Existing rows are not touched here — call
-    ``_transition_post_children`` separately if you want to move them.
-    """
-    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
-    _remove_deselected_platform_posts(request, post, selected_ids)
-    for acc_id in selected_ids:
-        try:
-            account = SocialAccount.objects.get(id=acc_id, workspace=workspace)
-        except SocialAccount.DoesNotExist:
-            continue
-        defaults = {}
-        if initial_status:
-            defaults["status"] = initial_status
-        pp, _created = PlatformPost.objects.get_or_create(
-            post=post,
-            social_account=account,
-            defaults=defaults,
-        )
-        override_title = request.POST.get(f"override_title_{acc_id}", "").strip()
-        override_caption = request.POST.get(f"override_caption_{acc_id}", "").strip()
-        override_comment = request.POST.get(f"override_comment_{acc_id}", "").strip()
-        pp.platform_specific_title = override_title if override_title else None
-        pp.platform_specific_caption = override_caption if override_caption else None
-        pp.platform_specific_first_comment = override_comment if override_comment else None
-
-        # Per-platform extras
-        if account.platform == "youtube":
-            tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
-            privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
-            if privacy_status not in ("public", "unlisted", "private"):
-                privacy_status = "public"
-            thumb_id = request.POST.get(f"yt_thumbnail_asset_id_{acc_id}", "").strip() or None
-            pp.platform_extra = {
-                "privacy_status": privacy_status,
-                "self_declared_made_for_kids": request.POST.get(f"yt_made_for_kids_{acc_id}") == "true",
-                "tags": tags_list,
-                "thumbnail_asset_id": thumb_id,
-            }
-
-        elif account.platform == "pinterest":
-            board_id = request.POST.get(f"pin_board_id_{acc_id}", "").strip()
-            if not board_id:
-                board_id = (pp.platform_extra or {}).get("board_id") or None
-            pp.platform_extra = {
-                "board_id": board_id,
-                "link_url": request.POST.get(f"pin_link_url_{acc_id}", "").strip() or None,
-                "alt_text": request.POST.get(f"pin_alt_text_{acc_id}", "").strip() or None,
-                "tag_products": request.POST.get(f"pin_tag_products_{acc_id}", "").strip() or None,
-                "allow_comments": request.POST.get(f"pin_allow_comments_{acc_id}") == "true",
-                "show_similar_products": request.POST.get(f"pin_show_similar_{acc_id}") == "true",
-                "cover_image_asset_id": request.POST.get(f"pin_cover_image_asset_id_{acc_id}", "").strip() or None,
-            }
-
-        elif account.platform == "tiktok" and f"tiktok_privacy_level_{acc_id}" in request.POST:
-            # Only rebuild extras when the TikTok panel was part of the form,
-            # so non-composer saves can't wipe a previously chosen privacy level.
-            privacy = request.POST.get(f"tiktok_privacy_level_{acc_id}", "").strip()
-            if privacy not in TIKTOK_PRIVACY_LEVELS:
-                # An empty/invalid submit (required-validation bypassed) must
-                # not wipe a previously saved choice.
-                privacy = (pp.platform_extra or {}).get("privacy_level", "")
-            # Comment / Duet / Stitch are independent interaction settings —
-            # TikTok's UX guidelines require a separate toggle per interaction,
-            # each greyed out on its own when the creator disabled it.
-            extra = {
-                "disable_comment": request.POST.get(f"tiktok_allow_comment_{acc_id}") != "true",
-                "disable_duet": request.POST.get(f"tiktok_allow_duet_{acc_id}") != "true",
-                "disable_stitch": request.POST.get(f"tiktok_allow_stitch_{acc_id}") != "true",
-                "brand_organic_toggle": request.POST.get(f"tiktok_brand_organic_{acc_id}") == "true",
-                "brand_content_toggle": request.POST.get(f"tiktok_brand_content_{acc_id}") == "true",
-                "is_aigc": request.POST.get(f"tiktok_is_aigc_{acc_id}") == "true",
-            }
-            if privacy:
-                extra["privacy_level"] = privacy
-            # Cover frame timestamp from the composer's frame picker; omitted
-            # when blank/invalid so TikTok falls back to the first frame.
-            # Parse with int() rather than str.isdigit() — isdigit() accepts
-            # non-ASCII digits (e.g. "²", "١٢") that int() then rejects with an
-            # unhandled ValueError.
-            cover_ms = request.POST.get(f"tiktok_video_cover_timestamp_ms_{acc_id}", "").strip()
-            if cover_ms:
-                try:
-                    cover_ms_val = int(cover_ms)
-                except ValueError:
-                    cover_ms_val = -1
-                if cover_ms_val >= 0:
-                    extra["video_cover_timestamp_ms"] = cover_ms_val
-            pp.platform_extra = extra
-
-        pp.save()
-
-
-def _validate_pinterest_board_selection(request, post, workspace):
-    """Selected Pinterest accounts need a board before composer save/submit."""
-    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
-    if not selected_ids:
-        return None
-
-    accounts = SocialAccount.objects.filter(id__in=selected_ids, workspace=workspace, platform="pinterest")
-    for account in accounts:
-        acc_id = str(account.id)
-        board_id = request.POST.get(f"pin_board_id_{acc_id}", "").strip()
-        if not board_id and post.pk:
-            board_id = (
-                PlatformPost.objects.filter(post=post, social_account=account)
-                .values_list("platform_extra__board_id", flat=True)
-                .first()
-                or ""
-            )
-        if not board_id:
-            return JsonResponse(
-                {"errors": {"pinterest_board": f"Select a Pinterest board for {account.account_name}."}},
-                status=400,
-            )
-    return None
-
-
-def _save_version(post, user):
-    """Create a PostVersion snapshot."""
-    version_number = (post.versions.count()) + 1
-    snapshot = {
-        "title": post.title,
-        "caption": post.caption,
-        "first_comment": post.first_comment,
-        "internal_notes": post.internal_notes,
-        "tags": post.tags,
-        "status": post.status,
-        "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else None,
-        "platform_posts": [
-            {
-                "social_account_id": str(pp.social_account_id),
-                "platform": pp.social_account.platform,
-                "title_override": pp.platform_specific_title,
-                "caption_override": pp.platform_specific_caption,
-                "first_comment_override": pp.platform_specific_first_comment,
-                "platform_extra": pp.platform_extra or {},
-            }
-            for pp in post.platform_posts.select_related("social_account")
-        ],
-        "media": [
-            {
-                "media_asset_id": str(pm.media_asset_id),
-                "position": pm.position,
-                "alt_text": pm.alt_text,
-            }
-            for pm in post.media_attachments.all()
-        ],
-    }
-    PostVersion.objects.create(
-        post=post,
-        version_number=version_number,
-        snapshot=snapshot,
-        created_by=user,
-    )
-
-
-def _resolve_queues_for_post(queue_id, workspace, post_data):
-    """Resolve the Queues to add a post to.
-
-    Returns a list of Queue objects - one per selected social account when
-    no explicit ``queue_id`` is supplied by the composer form. If an explicit
-    queue_id is provided it is used exclusively.
-    """
-    from apps.calendar.models import Queue
-
-    if queue_id:
-        q = Queue.objects.filter(id=queue_id, workspace=workspace, is_active=True).first()
-        return [q] if q else []
-
-    account_ids = _parse_selected_account_ids(post_data.get("selected_accounts", ""))
-    if not account_ids:
-        return []
-
-    queues = list(
-        Queue.objects.filter(workspace=workspace, is_active=True, social_account_id__in=account_ids).order_by(
-            "created_at"
-        )
-    )
-    # De-duplicate by social_account (one queue per account)
-    seen = set()
-    unique = []
-    for q in queues:
-        if q.social_account_id in seen:
-            continue
-        seen.add(q.social_account_id)
-        unique.append(q)
-    return unique
-
-
-def _resolve_template_data(template_id, workspace):
-    """Resolve a ?template= value into a template_data dict.
-
-    Accepts either a numeric ID for a built-in template (defined in
-    apps.composer.builtin_templates.TEMPLATES) or a UUID for a saved
-    PostTemplate row. Returns ``None`` if the value is missing, malformed,
-    or does not match any template.
-    """
-    if not template_id:
-        return None
-    # Built-in templates use numeric IDs.
-    try:
-        numeric_id = int(template_id)
-    except (TypeError, ValueError):
-        numeric_id = None
-    if numeric_id is not None:
-        from apps.composer.builtin_templates import TEMPLATES as BUILTIN_TEMPLATES
-
-        for tpl in BUILTIN_TEMPLATES:
-            if tpl.get("id") == numeric_id:
-                return {
-                    "caption": tpl.get("body", ""),
-                    "tags": list(tpl.get("tags", [])),
-                }
-        return None
-    # Fall back to PostTemplate UUID lookup.
-    try:
-        tpl = PostTemplate.objects.get(id=template_id, workspace=workspace)
-    except (PostTemplate.DoesNotExist, ValidationError):
-        return None
-    return tpl.template_data
 
 
 @login_required
@@ -426,7 +162,7 @@ def compose(request, workspace_id, post_id=None):
                 initial["scheduled_time"] = parsed_time.strftime("%H:%M")
         # Resolve ?template=<id> into template_data (supports both built-in int IDs
         # and PostTemplate UUIDs). Seed caption so it pre-fills the form.
-        template_data = _resolve_template_data(request.GET.get("template"), workspace)
+        template_data = editor.resolve_template_data(request.GET.get("template"), workspace)
         if template_data and template_data.get("caption"):
             initial["caption"] = template_data["caption"]
         form = PostForm(initial=initial)
@@ -634,434 +370,136 @@ def compose(request, workspace_id, post_id=None):
     return render(request, "composer/compose.html", context)
 
 
-def _transition_post_children(post, target, *, allow_via_draft=True, only=None):
-    """Transition every (or selected) PlatformPost child of *post* to *target*.
-
-    Returns ``(moved, skipped)`` lists of PlatformPost instances. Children
-    already in the target state are left alone (counted as moved). For states
-    that don't allow a direct transition, an intermediate hop through
-    ``draft`` is attempted when ``allow_via_draft`` is True.
-
-    ``only`` may be an iterable of PlatformPost IDs to restrict the operation
-    to a subset of children.
-    """
-    children = post.platform_posts.all()
-    if only is not None:
-        only_ids = {str(x) for x in only}
-        children = [pp for pp in children if str(pp.id) in only_ids]
-    moved, skipped = [], []
-    for pp in children:
-        if pp.status == target:
-            moved.append(pp)
-            continue
-        try:
-            if pp.can_transition_to(target):
-                pp.transition_to(target)
-            elif allow_via_draft and pp.can_transition_to("draft") and target != "draft":
-                pp.transition_to("draft")
-                if pp.can_transition_to(target):
-                    pp.transition_to(target)
-                else:
-                    skipped.append(pp)
-                    continue
-            else:
-                skipped.append(pp)
-                continue
-            pp.save(update_fields=["status", "published_at", "updated_at"])
-            moved.append(pp)
-        except ValueError:
-            skipped.append(pp)
-    return moved, skipped
-
-
-def _base_content_snapshot(post):
-    """Reviewable base content used to detect edits to an approved post."""
-    return (post.title, post.caption, post.first_comment, tuple(post.tags or []))
-
-
-def _revert_approved_to_review(post):
-    """Option A: editing an approved post's content sends it back for re-approval.
-
-    Silently reverts any ``approved`` children to ``pending_review`` so edited
-    content can't publish without a fresh review. (The explicit "Resubmit for
-    review" button additionally notifies reviewers; this is the safety net for
-    plain saves/autosaves.) Returns the reverted children.
-    """
-    reverted = []
-    for pp in post.platform_posts.all():
-        if pp.status == "approved" and pp.can_transition_to("pending_review"):
-            pp.transition_to("pending_review")
-            pp.save(update_fields=["status", "published_at", "updated_at"])
-            reverted.append(pp)
-    return reverted
-
-
-def _platform_status_map(post):
-    """Return ``{platform_post_id: status}`` for HTMX response headers."""
-    return {str(pp.id): pp.status for pp in post.platform_posts.all()}
-
-
-def _combine_schedule_dt(workspace, sched_date, sched_time):
-    """Combine the composer's date + time inputs into a workspace-tz-aware datetime.
-
-    Returns ``None`` unless both parts are present. Shared by the real
-    schedule (``action='schedule'``) and the draft-stage proposed time so both
-    interpret the same Schedule Post panel inputs identically.
-    """
-    if not (sched_date and sched_time):
-        return None
-    import zoneinfo
-
-    tz = zoneinfo.ZoneInfo(workspace.effective_timezone or "UTC")
-    return datetime.combine(sched_date, sched_time).replace(tzinfo=tz)
-
-
-def _capture_proposed_publish_at(post, post_id, workspace, form, *, clear_when_blank=True):
-    """Set ``post.proposed_publish_at`` from the composer's Schedule Post panel.
-
-    Used by the draft-stage save actions (save draft, submit/resubmit for
-    approval) so a proposed time entered in the panel is persisted and shown in
-    the drafts/approval lists. Mutates ``post`` in place; the caller persists it.
-
-    A no-op once the post is committed to publishing — ``post.scheduled_at`` is
-    set or any child is scheduled/publishing/published — because then the
-    date/time inputs reflect the live schedule (pre-filled from ``scheduled_at``)
-    and must not be reinterpreted as a proposal.
-
-    ``clear_when_blank`` (default True, for Save Draft where the panel *is* the
-    proposed-time editor) clears the proposal when the panel is empty. The
-    approval submit/resubmit actions pass False so routing a draft through
-    approval with an untouched/absent panel can't silently wipe a proposal an
-    agent set via the REST/MCP API.
-    """
-    already_scheduled = post.scheduled_at is not None or (
-        bool(post_id) and post.platform_posts.filter(status__in=["scheduled", "publishing", "published"]).exists()
+def _payload_from_form(request, form):
+    """Build the shared editor payload from the composer's form POST."""
+    data = request.POST
+    accounts = []
+    for acc_id in _parse_selected_account_ids(data.get("selected_accounts", "")):
+        account = SocialAccount.objects.filter(id=acc_id).only("platform").first()
+        platform = account.platform if account else ""
+        extra = None
+        if platform == "youtube":
+            extra = {
+                "tags": data.get(f"yt_tags_{acc_id}", ""),
+                "privacy_status": data.get(f"yt_privacy_status_{acc_id}", "public"),
+                "made_for_kids": data.get(f"yt_made_for_kids_{acc_id}"),
+                "thumbnail_asset_id": data.get(f"yt_thumbnail_asset_id_{acc_id}", ""),
+            }
+        elif platform == "pinterest":
+            extra = {
+                "board_id": data.get(f"pin_board_id_{acc_id}", ""),
+                "link_url": data.get(f"pin_link_url_{acc_id}", ""),
+                "alt_text": data.get(f"pin_alt_text_{acc_id}", ""),
+                "tag_products": data.get(f"pin_tag_products_{acc_id}", ""),
+                "allow_comments": data.get(f"pin_allow_comments_{acc_id}"),
+                "show_similar_products": data.get(f"pin_show_similar_{acc_id}"),
+                "cover_image_asset_id": data.get(f"pin_cover_image_asset_id_{acc_id}", ""),
+            }
+        elif platform == "tiktok" and f"tiktok_privacy_level_{acc_id}" in data:
+            # Only rebuild extras when the TikTok panel was part of the form,
+            # so non-composer saves can't wipe a previously chosen privacy level.
+            extra = {
+                "privacy_level": data.get(f"tiktok_privacy_level_{acc_id}", ""),
+                "allow_comment": data.get(f"tiktok_allow_comment_{acc_id}"),
+                "allow_duet": data.get(f"tiktok_allow_duet_{acc_id}"),
+                "allow_stitch": data.get(f"tiktok_allow_stitch_{acc_id}"),
+                "brand_organic": data.get(f"tiktok_brand_organic_{acc_id}"),
+                "brand_content": data.get(f"tiktok_brand_content_{acc_id}"),
+                "is_aigc": data.get(f"tiktok_is_aigc_{acc_id}"),
+                "video_cover_timestamp_ms": data.get(f"tiktok_video_cover_timestamp_ms_{acc_id}", ""),
+            }
+        accounts.append(
+            editor.AccountInput(
+                id=acc_id,
+                title=data.get(f"override_title_{acc_id}", ""),
+                caption=data.get(f"override_caption_{acc_id}", ""),
+                first_comment=data.get(f"override_comment_{acc_id}", ""),
+                extra=extra,
+            )
+        )
+    cd = form.cleaned_data
+    recurring = None
+    if data.get("make_recurring"):
+        recurring = {
+            "frequency": data.get("recurrence_frequency", "weekly"),
+            "interval": data.get("recurrence_interval", "1"),
+            "end_date": data.get("recurrence_end_date", ""),
+        }
+    return editor.EditorPayload(
+        action=data.get("action", "save_draft"),
+        title=cd.get("title") or "",
+        caption=cd.get("caption") or "",
+        first_comment=cd.get("first_comment") or "",
+        internal_notes=cd.get("internal_notes") or "",
+        tags=cd.get("tags") or [],
+        category_id=str(cd["category"].id) if cd.get("category") else None,
+        accounts=accounts,
+        account_scope=_get_account_scope(request),
+        media_asset_ids=None,
+        scheduled_date=cd.get("scheduled_date"),
+        scheduled_time=cd.get("scheduled_time"),
+        queue_id=data.get("queue_id") or None,
+        recurring=recurring,
     )
-    if already_scheduled:
-        return
-    proposed = _combine_schedule_dt(
-        workspace,
-        form.cleaned_data.get("scheduled_date"),
-        form.cleaned_data.get("scheduled_time"),
-    )
-    if proposed is None and not clear_when_blank:
-        return
-    post.proposed_publish_at = proposed
+
+
+def _pop_pending_media(request, workspace):
+    """Media queued in the session while composing a new post."""
+    session_key = f"pending_media_{workspace.id}"
+    pending_ids = request.session.get(session_key, [])
+    if pending_ids:
+        del request.session[session_key]
+    return pending_ids
+
+
+def _saved_response(request, workspace, post):
+    if request.htmx:
+        return HttpResponse(
+            status=204,
+            headers={
+                "HX-Trigger": json.dumps({"postSaved": {"postId": str(post.id), "status": post.status}}),
+                "X-Platform-Statuses": json.dumps(editor.platform_status_map(post)),
+            },
+        )
+    return redirect("composer:compose_edit", workspace_id=workspace.id, post_id=post.id)
 
 
 @login_required
 @require_permission("create_posts")
 @require_POST
 def save_post(request, workspace_id, post_id=None):
-    """Save or update a post (draft, schedule, or publish action)."""
+    """Save or update a post (draft, schedule, queue, approval or publish action)."""
     workspace = _get_workspace(request, workspace_id)
-    action = request.POST.get("action", "save_draft")
+    membership = request.workspace_membership
+    perms = membership.effective_permissions if membership else {}
 
+    post = None
+    orig_content = None
     if post_id:
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
-        # Enforce edit permissions: authors can edit their own, others need edit_others_posts
-        membership = request.workspace_membership
-        perms = membership.effective_permissions if membership else {}
-        if post.author != request.user and not perms.get("edit_others_posts", False):
-            raise PermissionDenied("You do not have permission to edit this post.")
-        _orig_content = _base_content_snapshot(post)
+        editor.check_can_edit(post, request.user, perms)
+        orig_content = editor.base_content_snapshot(post)  # before the form mutates the instance
         form = PostForm(request.POST, instance=post)
     else:
-        _orig_content = None
         form = PostForm(request.POST)
-
     if not form.is_valid():
         return JsonResponse({"errors": form.errors}, status=400)
 
-    post = form.save(commit=False)
-    post.workspace = workspace
-    if not post_id:
-        post.author = request.user
-
-    pinterest_board_error = _validate_pinterest_board_selection(request, post, workspace)
-    if pinterest_board_error is not None:
-        return pinterest_board_error
-
-    # Handle action — note that Post itself no longer carries an editorial
-    # status: every transition below operates on the PlatformPost children,
-    # which is why we sync those before/after running it.
-    pending_target = None  # what to transition existing children to after sync
-    initial_status = "draft"  # default status for newly created PlatformPosts
-
-    if action == "schedule":
-        aware_dt = _combine_schedule_dt(
-            workspace,
-            form.cleaned_data.get("scheduled_date"),
-            form.cleaned_data.get("scheduled_time"),
-        )
-        if aware_dt:
-            if aware_dt <= timezone.now():
-                return JsonResponse(
-                    {"errors": {"schedule": "Scheduled time must be in the future."}},
-                    status=400,
-                )
-            post.scheduled_at = aware_dt
-            # A committed schedule supersedes any draft-stage proposal.
-            post.proposed_publish_at = None
-            # Propagate the manually chosen time to every PlatformPost so all
-            # selected platforms publish at the same moment.
-            post._schedule_propagate_dt = aware_dt  # handled after post.save()
-            pending_target = "scheduled"
-            initial_status = "scheduled"
-        else:
-            return JsonResponse({"errors": {"schedule": "Date and time required."}}, status=400)
-    elif action == "publish_now":
-        # Server-side permission check - only roles with publish_directly can bypass approval
-        membership = request.workspace_membership
-        perms = membership.effective_permissions if membership else {}
-        if not perms.get("publish_directly", False):
-            raise PermissionDenied("You do not have permission to publish directly.")
-        now_dt = timezone.now()
-        post.scheduled_at = now_dt
-        post.proposed_publish_at = None
-        post._schedule_propagate_dt = now_dt  # handled after post.save()
-        pending_target = "scheduled"
-        initial_status = "scheduled"
-    elif action == "add_to_queue":
-        from django.db import transaction
-
-        from apps.calendar.services import QueueFullError, add_to_queue
-
-        queue_id = request.POST.get("queue_id")
-        queues = _resolve_queues_for_post(queue_id, workspace, request.POST)
-        if not queues:
-            return JsonResponse({"errors": {"queue": "No active queue found for the selected channel."}}, status=400)
-        # Queueing assigns real per-platform slots below — drop any proposal.
-        post.proposed_publish_at = None
-        post.save()
-        # Ensure PlatformPost rows exist for every selected account before the
-        # queue service writes per-platform scheduled_at values.
-        _sync_platform_posts(request, post, workspace, initial_status="draft")
-        # "Next Available" always places the post in the queue's soonest open
-        # slot. It deliberately ignores the Schedule-panel date/time: those
-        # inputs are prefilled from the post's own scheduled_at/proposed time
-        # when editing, and treating them as a floor would push the post past
-        # the true next slot.
-        try:
-            # One transaction across every queue: if a later queue is full, the
-            # earlier queues' slot writes roll back instead of leaving a child
-            # half-queued.
-            with transaction.atomic():
-                for q in queues:
-                    add_to_queue(post, q)
-                # Transition every child whose scheduled_at was filled in.
-                _transition_post_children(post, "scheduled", only=_scoped_platform_post_ids(request, post))
-        except QueueFullError:
-            return JsonResponse({"errors": {"queue": _QUEUE_FULL_MSG}}, status=400)
-        _save_version(post, request.user)
-        if request.htmx:
-            return HttpResponse(
-                status=204,
-                headers={
-                    "HX-Trigger": json.dumps({"postSaved": {"postId": str(post.id), "status": post.status}}),
-                    "X-Platform-Statuses": json.dumps(_platform_status_map(post)),
-                },
-            )
-        return redirect("composer:compose_edit", workspace_id=workspace.id, post_id=post.id)
-    elif action == "add_to_queue_priority":
-        from django.db import transaction
-
-        from apps.calendar.services import QueueFullError, add_to_queue
-
-        queue_id = request.POST.get("queue_id")
-        queues = _resolve_queues_for_post(queue_id, workspace, request.POST)
-        if not queues:
-            return JsonResponse({"errors": {"queue": "No active queue found for the selected channel."}}, status=400)
-        # Queueing assigns real per-platform slots below — drop any proposal.
-        post.proposed_publish_at = None
-        post.save()
-        _sync_platform_posts(request, post, workspace, initial_status="draft")
-        try:
-            # One transaction across every queue (see add_to_queue above).
-            with transaction.atomic():
-                for q in queues:
-                    add_to_queue(post, q, priority=True)
-                _transition_post_children(post, "scheduled", only=_scoped_platform_post_ids(request, post))
-        except QueueFullError:
-            return JsonResponse({"errors": {"queue": _QUEUE_FULL_MSG}}, status=400)
-        _save_version(post, request.user)
-        if request.htmx:
-            return HttpResponse(
-                status=204,
-                headers={
-                    "HX-Trigger": json.dumps({"postSaved": {"postId": str(post.id), "status": post.status}}),
-                    "X-Platform-Statuses": json.dumps(_platform_status_map(post)),
-                },
-            )
-        return redirect("composer:compose_edit", workspace_id=workspace.id, post_id=post.id)
-    elif action == "submit_for_approval":
-        # Save post first so it has a PK, then delegate to approval service
-        _capture_proposed_publish_at(post, post_id, workspace, form, clear_when_blank=False)
-        post.save()
-        # Sync platform posts before submitting
-        _sync_platform_posts(request, post, workspace, initial_status="draft")
-        _save_version(post, request.user)
-        from apps.approvals.services import submit_for_review
-
-        submit_for_review(post, request.user, workspace)
-        if request.htmx:
-            return HttpResponse(
-                status=204,
-                headers={
-                    "HX-Trigger": json.dumps({"postSaved": {"postId": str(post.id), "status": post.status}}),
-                    "X-Platform-Statuses": json.dumps(_platform_status_map(post)),
-                },
-            )
-        return redirect("composer:compose_edit", workspace_id=workspace.id, post_id=post.id)
-    elif action == "resubmit_for_approval":
-        # Resubmit after changes requested or rejection
-        _capture_proposed_publish_at(post, post_id, workspace, form, clear_when_blank=False)
-        post.save()
-        _sync_platform_posts(request, post, workspace, initial_status="draft")
-        _save_version(post, request.user)
-        from apps.approvals.services import resubmit_post
-
-        resubmit_post(post, request.user, workspace)
-        if request.htmx:
-            return HttpResponse(
-                status=204,
-                headers={
-                    "HX-Trigger": json.dumps({"postSaved": {"postId": str(post.id), "status": post.status}}),
-                    "X-Platform-Statuses": json.dumps(_platform_status_map(post)),
-                },
-            )
-        return redirect("composer:compose_edit", workspace_id=workspace.id, post_id=post.id)
-    elif action == "save_draft":
-        # The Schedule Post panel doubles as the proposed-time picker for a
-        # draft; capture it (or clear it when blank) before the save below.
-        _capture_proposed_publish_at(post, post_id, workspace, form)
-    # Fall through (save_draft / unknown action): persist below; existing
-    # children are left as-is, new children default to draft via initial_status.
-
-    post.save()
-
-    # Attach pending session media for new posts
-    if not post_id:
-        from apps.media_library.models import MediaAsset as _MediaAsset
-
-        session_key = f"pending_media_{workspace.id}"
-        pending_ids = request.session.get(session_key, [])
-        if pending_ids:
-            for idx, asset_id in enumerate(pending_ids):
-                try:
-                    asset = _MediaAsset.objects.get(id=asset_id, workspace=workspace)
-                    PostMedia.objects.get_or_create(
-                        post=post,
-                        media_asset=asset,
-                        defaults={"position": idx},
-                    )
-                except _MediaAsset.DoesNotExist:
-                    continue
-            del request.session[session_key]
-
-    # Sync any new tags to the Tag model
-    _sync_tags_to_model(workspace, post.tags)
-
-    # Handle recurring post creation
-    make_recurring = request.POST.get("make_recurring")
-    if make_recurring and action == "schedule" and post.scheduled_at:
-        from apps.calendar.models import RecurrenceRule
-
-        frequency = request.POST.get("recurrence_frequency", "weekly")
-        interval_str = request.POST.get("recurrence_interval", "1")
-        end_date_str = request.POST.get("recurrence_end_date", "")
-        try:
-            interval_val = int(interval_str)
-        except (ValueError, TypeError):
-            interval_val = 1
-        end_date_val = None
-        if end_date_str:
-            try:
-                from datetime import date as date_cls
-
-                end_date_val = date_cls.fromisoformat(end_date_str)
-            except (ValueError, TypeError):
-                pass
-        RecurrenceRule.objects.update_or_create(
-            post=post,
-            defaults={
-                "frequency": frequency,
-                "interval": interval_val,
-                "end_date": end_date_val,
-                "is_active": True,
-            },
-        )
-
-    # Sync platform posts (newly-created rows inherit ``initial_status`` for
-    # this action — e.g. "scheduled" for schedule/publish_now, "draft" for
-    # save_draft).
-    _sync_platform_posts(request, post, workspace, initial_status=initial_status)
-
-    # Propagate manually-chosen schedule/publish_now datetimes to every
-    # PlatformPost now that they exist — except published/publishing rows
-    # (their schedule is history) and, in scoped mode, siblings outside the
-    # ``?account=`` scope.
-    scoped_ids = _scoped_platform_post_ids(request, post)
-    propagate_dt = getattr(post, "_schedule_propagate_dt", None)
-    if propagate_dt is not None:
-        propagate_qs = post.platform_posts.exclude(status__in=PlatformPost.PROTECTED_STATUSES)
-        if scoped_ids is not None:
-            propagate_qs = propagate_qs.filter(id__in=scoped_ids)
-        propagate_qs.update(scheduled_at=propagate_dt)
-
-    # Option A: editing an approved post's reviewable content sends it back for
-    # re-approval so edits can't publish un-reviewed. Run this BEFORE applying any
-    # publish target — otherwise a schedule/publish_now in the *same* save would
-    # push the just-edited (no-longer-approved) content straight to scheduled.
-    # Only ``approved`` children are reverted; anything else is a no-op.
-    content_changed = _orig_content is not None and _base_content_snapshot(post) != _orig_content
-    reverted_ids = {str(pp.id) for pp in _revert_approved_to_review(post)} if content_changed else set()
-
-    # Move existing children to the requested target state (no-op for save_draft —
-    # children that are already mid-workflow stay put). Children just reverted for
-    # re-review are excluded so a same-save publish action can't drag them back
-    # out of review.
-    if pending_target:
-        if reverted_ids:
-            candidates = scoped_ids if scoped_ids is not None else [pp.id for pp in post.platform_posts.all()]
-            target_only = [pid for pid in candidates if str(pid) not in reverted_ids]
-        else:
-            target_only = scoped_ids
-        _transition_post_children(post, pending_target, only=target_only)
-
-    # Save version
-    _save_version(post, request.user)
-
-    # Return appropriate response
-    if request.htmx:
-        return HttpResponse(
-            status=204,
-            headers={
-                "HX-Trigger": json.dumps(
-                    {
-                        "postSaved": {
-                            "postId": str(post.id),
-                            "status": post.status,
-                        }
-                    }
-                ),
-                "X-Platform-Statuses": json.dumps(_platform_status_map(post)),
-            },
-        )
-
-    return redirect("composer:compose_edit", workspace_id=workspace.id, post_id=post.id)
+    payload = _payload_from_form(request, form)
+    if post is None:
+        # A new post adopts whatever the media picker queued in the session.
+        payload.media_asset_ids = _pop_pending_media(request, workspace)
+    try:
+        post = editor.save(post, workspace, request.user, perms, payload, orig_content=orig_content)
+    except editor.EditorError as exc:
+        return JsonResponse({"errors": exc.errors}, status=400)
+    return _saved_response(request, workspace, post)
 
 
 @login_required
 @require_POST
 def transition_platform_post(request, workspace_id, post_id, platform_post_id):
-    """Transition a single PlatformPost to a target editorial status.
-
-    Used by the composer's per-account chip menu so the user can take a single
-    social account in/out of draft, schedule, etc. without affecting siblings.
-    Permission rules mirror save_post: ``approve_posts`` is required for any
-    approval-stage target; ``publish_directly`` is required for scheduled.
-    """
+    """Move a single PlatformPost (the composer's per-account chip menu)."""
     workspace = _get_workspace(request, workspace_id)
     pp = get_object_or_404(
         PlatformPost.objects.select_related("post", "social_account"),
@@ -1072,31 +510,14 @@ def transition_platform_post(request, workspace_id, post_id, platform_post_id):
     target = (request.POST.get("target_status") or "").strip()
     if not target:
         return JsonResponse({"error": "target_status required"}, status=400)
-
     membership = request.workspace_membership
     perms = membership.effective_permissions if membership else {}
-    approval_states = {"approved", "pending_review", "pending_client", "changes_requested", "rejected"}
-    if target in ("scheduled", "publishing") and not perms.get("publish_directly", False):
-        raise PermissionDenied("You do not have permission to schedule this post.")
-    if target in approval_states and not perms.get("approve_posts", False) and target != "pending_review":
-        raise PermissionDenied("You do not have permission to make approval decisions.")
-
     if pp.status == target:
         return JsonResponse({"ok": True, "status": pp.status, "noop": True})
-
     try:
-        pp.transition_to(target)
+        editor.transition_child(pp, target, perms)
     except ValueError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
-    pp.save(update_fields=["status", "published_at", "updated_at"])
-    # Committing a child to publishing obsoletes any draft-stage proposal.
-    # Clear it directly rather than via sync_post_scheduled_at: this view sets
-    # ``scheduled`` WITHOUT a ``scheduled_at``, and the publisher relies on the
-    # ``Coalesce(scheduled_at, post__scheduled_at)`` fallback — recomputing the
-    # Post.scheduled_at aggregate here could strand a post that depends on it.
-    if target in ("scheduled", "publishing", "published") and pp.post.proposed_publish_at is not None:
-        pp.post.proposed_publish_at = None
-        pp.post.save(update_fields=["proposed_publish_at", "updated_at"])
     return JsonResponse({"ok": True, "status": pp.status, "platform_post_id": str(pp.id)})
 
 
@@ -1104,80 +525,34 @@ def transition_platform_post(request, workspace_id, post_id, platform_post_id):
 @require_permission("create_posts")
 @require_POST
 def autosave(request, workspace_id, post_id=None):
-    """Auto-save endpoint called every 30 seconds via HTMX.
-
-    On first save for a new post (no post_id), creates the draft and returns
-    an HX-Trigger with the new post ID so the client can switch the autosave
-    URL to the edit endpoint, preventing duplicate drafts on subsequent ticks.
-    """
+    """Auto-save every 30 seconds; the first save of a new post creates the draft."""
     workspace = _get_workspace(request, workspace_id)
+    membership = request.workspace_membership
+    perms = membership.effective_permissions if membership else {}
 
-    is_new = False
-    orig_content = None
+    post = None
     if post_id:
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
-        # Enforce edit permissions on existing posts
-        membership = request.workspace_membership
-        perms = membership.effective_permissions if membership else {}
-        if post.author != request.user and not perms.get("edit_others_posts", False):
-            raise PermissionDenied("You do not have permission to edit this post.")
-        orig_content = _base_content_snapshot(post)
+        editor.check_can_edit(post, request.user, perms)
     else:
-        # Check if a previous autosave already created a draft for this session
-        # by looking for the post_id passed from the client
         client_post_id = request.POST.get("_autosave_post_id", "").strip()
         if client_post_id:
-            try:
-                post = Post.objects.get(id=client_post_id, workspace=workspace)
-            except Post.DoesNotExist:
-                post = Post(workspace=workspace, author=request.user)
-                is_new = True
-        else:
-            post = Post(workspace=workspace, author=request.user)
-            is_new = True
+            post = Post.objects.filter(id=client_post_id, workspace=workspace).first()
+    is_new = post is None
 
-    post.title = request.POST.get("title", "")
-    post.caption = request.POST.get("caption", "")
-    post.first_comment = request.POST.get("first_comment", "")
-    post.internal_notes = request.POST.get("internal_notes", "")
-
-    post.tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
-
-    post.save()
-
-    # Attach pending session media when creating a new post
-    if is_new:
-        from apps.media_library.models import MediaAsset
-
-        session_key = f"pending_media_{workspace.id}"
-        pending_ids = request.session.get(session_key, [])
-        if pending_ids:
-            for idx, asset_id in enumerate(pending_ids):
-                try:
-                    asset = MediaAsset.objects.get(id=asset_id, workspace=workspace)
-                    PostMedia.objects.get_or_create(
-                        post=post,
-                        media_asset=asset,
-                        defaults={"position": idx},
-                    )
-                except MediaAsset.DoesNotExist:
-                    continue
-            del request.session[session_key]
-
-    # Sync platform selections
-    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
-    _remove_deselected_platform_posts(request, post, selected_ids)
-    for acc_id in selected_ids:
-        PlatformPost.objects.get_or_create(
-            post=post,
-            social_account_id=acc_id,
-        )
-
-    # Option A: an autosave that changed an approved post's content reverts it to
-    # pending_review so edited content can't publish without a fresh review.
-    if orig_content is not None and _base_content_snapshot(post) != orig_content:
-        _revert_approved_to_review(post)
-
+    data = request.POST
+    payload = editor.EditorPayload(
+        action="autosave",
+        title=data.get("title", ""),
+        caption=data.get("caption", ""),
+        first_comment=data.get("first_comment", ""),
+        internal_notes=data.get("internal_notes", ""),
+        tags=parse_and_truncate_tag_string(data.get("tags", "")),
+        accounts=[editor.AccountInput(id=a) for a in _parse_selected_account_ids(data.get("selected_accounts", ""))],
+        account_scope=_get_account_scope(request),
+        media_asset_ids=_pop_pending_media(request, workspace) if is_new else None,
+    )
+    post = editor.save(post, workspace, request.user, perms, payload)
     return HttpResponse(
         f'<span class="text-xs text-gray-400">Saved {timezone.now().strftime("%H:%M")}</span>',
         headers={"HX-Trigger": json.dumps({"autosaved": {"postId": str(post.id), "isNew": is_new}})},
@@ -1535,342 +910,6 @@ def media_filmstrip(request, workspace_id, asset_id):
     return JsonResponse({"frames": frames, "duration": duration})
 
 
-UNSPLASH_API_BASE = "https://api.unsplash.com"
-UNSPLASH_IMAGE_HOST = "https://images.unsplash.com/"
-UNSPLASH_NOT_CONFIGURED = (
-    "Unsplash is not configured. Add UNSPLASH_ACCESS_KEY to your environment to enable stock-photo search."
-)
-UNSPLASH_MAX_IMPORT = 10
-UNSPLASH_MAX_IMAGE_BYTES = 15 * 1024 * 1024
-
-
-def _as_str(value):
-    """Coerce an external/client JSON field to a string.
-
-    Client- and Unsplash-supplied payloads can carry ``null`` (or numbers)
-    where we expect a URL/text, so guard before ``.startswith()`` or feeding
-    a model's non-null string column - otherwise an ``AttributeError`` (or
-    IntegrityError) turns a should-fail-gracefully path into a 500.
-    """
-    return value if isinstance(value, str) else ""
-
-
-@login_required
-@require_GET
-def unsplash_search(request, workspace_id):
-    """Proxy an Unsplash photo search so the API key stays server-side.
-
-    Returns results trimmed to what the composer modal needs. Grid images are
-    hotlinked from the Unsplash CDN per their API guidelines.
-    """
-    _get_workspace(request, workspace_id)
-
-    if not settings.UNSPLASH_ACCESS_KEY:
-        return JsonResponse({"error": UNSPLASH_NOT_CONFIGURED}, status=503)
-
-    query = request.GET.get("q", "").strip()
-    if not query:
-        return JsonResponse({"error": "Missing search query"}, status=400)
-
-    try:
-        resp = httpx.get(
-            f"{UNSPLASH_API_BASE}/search/photos",
-            params={"query": query, "page": 1, "per_page": 24},
-            headers={
-                "Authorization": f"Client-ID {settings.UNSPLASH_ACCESS_KEY}",
-                "Accept-Version": "v1",
-            },
-            timeout=10.0,
-        )
-    except httpx.RequestError:
-        return JsonResponse({"error": "Could not reach Unsplash. Try again."}, status=502)
-
-    if resp.status_code in (401, 403):
-        return JsonResponse({"error": "Unsplash rejected the API key. Check UNSPLASH_ACCESS_KEY."}, status=502)
-    if resp.status_code == 429:
-        return JsonResponse({"error": "Unsplash rate limit reached. Try again in a few minutes."}, status=429)
-    if resp.status_code != 200:
-        return JsonResponse({"error": "Unsplash search failed. Try again."}, status=502)
-
-    # A 200 with a malformed body or an unexpected result shape (e.g. a bare
-    # list or null instead of an object) must surface as a friendly 502, not
-    # an unhandled 500.
-    try:
-        data = resp.json()
-        if not isinstance(data, dict):
-            raise ValueError("Unexpected Unsplash response shape")
-        results = [
-            {
-                "id": p["id"],
-                "thumb": p["urls"]["small"],
-                "full": p["urls"]["regular"],
-                "width": p.get("width"),
-                "height": p.get("height"),
-                "color": p.get("color"),
-                "alt": p.get("alt_description") or p.get("description") or "",
-                "photographer": p["user"]["name"],
-                "photographer_url": p["user"]["links"]["html"],
-                "photo_url": p["links"]["html"],
-                "download_location": p["links"]["download_location"],
-            }
-            for p in data.get("results", [])
-        ]
-        total = data.get("total", 0)
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return JsonResponse({"error": "Unexpected response from Unsplash. Try again."}, status=502)
-    return JsonResponse({"results": results, "total": total})
-
-
-@login_required
-@require_POST
-def unsplash_import(request, workspace_id, post_id=None):
-    """Download selected Unsplash photos server-side and attach them as media.
-
-    Mirrors upload_media: attaches to the post when post_id is given, else
-    queues in the pending-media session. Hits each photo's download_location
-    first, as Unsplash's guidelines require when a photo is actually used.
-    """
-    workspace = _get_workspace(request, workspace_id)
-
-    if not settings.UNSPLASH_ACCESS_KEY:
-        return JsonResponse({"error": UNSPLASH_NOT_CONFIGURED}, status=503)
-
-    try:
-        payload = json.loads(request.body)
-        photos = payload["photos"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return JsonResponse({"error": "Invalid request body"}, status=400)
-
-    if not isinstance(photos, list) or not photos:
-        return JsonResponse({"error": "No photos selected"}, status=400)
-    if len(photos) > UNSPLASH_MAX_IMPORT:
-        return JsonResponse({"error": f"Select at most {UNSPLASH_MAX_IMPORT} photos per import."}, status=400)
-
-    from django.core.files.base import ContentFile
-
-    from apps.media_library.models import MediaAsset
-    from apps.media_library.quotas import StorageQuotaExceededError, enforce_storage_quota
-
-    post = None
-    if post_id:
-        post = get_object_or_404(Post, id=post_id, workspace=workspace)
-
-    auth_headers = {"Authorization": f"Client-ID {settings.UNSPLASH_ACCESS_KEY}"}
-    new_assets = []
-    attachments = []
-    failed = 0
-    quota_exceeded = False
-
-    # follow_redirects is OFF: the host allowlist below is only meaningful if a
-    # 30x can't bounce the request to an internal address (SSRF). One pooled
-    # client reuses connections across the per-photo registration + download.
-    with httpx.Client(follow_redirects=False, timeout=30.0) as client:
-        for photo in photos:
-            if not isinstance(photo, dict):
-                failed += 1
-                continue
-            photo_id = _as_str(photo.get("id")).strip()
-            download_location = _as_str(photo.get("download_location"))
-            fallback_url = _as_str(photo.get("full"))
-            # The client supplies these URLs - only ever fetch from Unsplash hosts.
-            if not photo_id or not download_location.startswith(f"{UNSPLASH_API_BASE}/"):
-                failed += 1
-                continue
-
-            content = None
-            content_type = ""
-            try:
-                # Register the download (required by Unsplash API guidelines);
-                # the response carries the actual file URL to fetch. A non-JSON
-                # body here must fail this one photo, not the whole request.
-                dl_resp = client.get(download_location, headers=auth_headers, timeout=10.0)
-                image_url = ""
-                if dl_resp.status_code == 200:
-                    # A non-JSON or non-object body must fail this one photo,
-                    # not 500 the whole request.
-                    with contextlib.suppress(ValueError, AttributeError):
-                        image_url = _as_str(dl_resp.json().get("url"))
-                if not image_url:
-                    image_url = fallback_url
-                if not image_url.startswith(UNSPLASH_IMAGE_HOST):
-                    failed += 1
-                    continue
-
-                # Stream and cap the download so a huge (or mis-declared) body
-                # can't be buffered whole - reject before exceeding the limit.
-                with client.stream("GET", image_url) as img_resp:
-                    content_type = img_resp.headers.get("content-type", "")
-                    declared = img_resp.headers.get("content-length", "")
-                    if (
-                        img_resp.status_code != 200
-                        or not content_type.startswith("image/")
-                        or (declared.isdigit() and int(declared) > UNSPLASH_MAX_IMAGE_BYTES)
-                    ):
-                        failed += 1
-                        continue
-                    buf = bytearray()
-                    for chunk in img_resp.iter_bytes():
-                        buf += chunk
-                        if len(buf) > UNSPLASH_MAX_IMAGE_BYTES:
-                            break
-                    if len(buf) > UNSPLASH_MAX_IMAGE_BYTES:
-                        failed += 1
-                        continue
-                    content = bytes(buf)
-            except httpx.HTTPError:
-                failed += 1
-                continue
-
-            try:
-                enforce_storage_quota(workspace.organization, len(content))
-            except StorageQuotaExceededError:
-                quota_exceeded = True
-                break
-
-            filename = f"unsplash-{photo_id}.jpg"
-            asset = MediaAsset.objects.create(
-                organization=workspace.organization,
-                workspace=workspace,
-                uploaded_by=request.user,
-                file=ContentFile(content, name=filename),
-                filename=filename,
-                media_type=MediaAsset.MediaType.IMAGE,
-                mime_type=content_type,
-                file_size=len(content),
-                source="unsplash",
-                source_url=_as_str(photo.get("photo_url")),
-                attribution=f"Photo by {_as_str(photo.get('photographer')) or 'Unknown'} on Unsplash",
-                alt_text=_as_str(photo.get("alt")),
-            )
-            new_assets.append(asset)
-            attachment = _attach_asset_for_composer(request, workspace, asset, post)
-            if attachment is not None:
-                attachments.append(attachment)
-
-    if not new_assets:
-        if quota_exceeded:
-            return JsonResponse(
-                {"error": "Storage quota exceeded. Free up space or upgrade your plan."},
-                status=413,
-            )
-        return JsonResponse({"error": "Could not import the selected photos."}, status=502)
-
-    if post is not None:
-        html = render_to_string(
-            "composer/partials/media_list.html",
-            {"media_attachments": attachments, "post": post, "workspace": workspace},
-            request=request,
-        )
-    else:
-        html = render_to_string(
-            "composer/partials/media_list_pending.html",
-            {"pending_assets": new_assets, "workspace": workspace},
-            request=request,
-        )
-
-    return JsonResponse(
-        {
-            "html": html,
-            "assets": [{"id": str(a.id), "url": a.file.url} for a in new_assets],
-            "failed": failed,
-        }
-    )
-
-
-@login_required
-@require_GET
-def pinterest_boards(request, workspace_id, account_id):
-    """Fetch Pinterest boards for board selection in the composer."""
-    workspace = _get_workspace(request, workspace_id)
-    account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace, platform="pinterest")
-
-    from apps.credentials.models import resolve_platform_credentials
-    from providers import get_provider
-
-    # .env is dominant; admin-entered org credentials are the fallback.
-    credentials = resolve_platform_credentials("pinterest", workspace.organization_id)
-
-    provider = get_provider("pinterest", credentials)
-
-    # Refresh token if expiring
-    access_token = account.oauth_access_token
-    if account.token_expires_at and account.is_token_expiring_soon:
-        try:
-            access_token = account.refresh_oauth_token(provider)
-        except Exception:
-            return JsonResponse({"error": "Token refresh failed"}, status=502)
-
-    try:
-        boards = provider.get_boards(access_token)
-    except Exception:
-        return JsonResponse({"error": "Failed to fetch boards"}, status=502)
-
-    return JsonResponse({"boards": [{"id": b.get("id"), "name": b.get("name")} for b in boards]})
-
-
-@login_required
-@require_GET
-def tiktok_creator_info(request, workspace_id, account_id):
-    """Fetch TikTok creator info for the composer's TikTok settings panel.
-
-    TikTok's integration guidelines require querying this fresh before each
-    post: the allowed privacy levels depend on the app's audit status and the
-    creator's account settings.
-    """
-    workspace = _get_workspace(request, workspace_id)
-    account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace, platform="tiktok")
-
-    from apps.credentials.models import resolve_platform_credentials
-    from providers import get_provider
-
-    credentials = resolve_platform_credentials("tiktok", workspace.organization_id)
-    provider = get_provider("tiktok", credentials)
-
-    # This endpoint enriches the composer panel; the real privacy/audit gate is
-    # enforced at publish time. When the creator-info lookup can't run (no
-    # token, expired token, TikTok API down), degrade to a 200 with empty
-    # options and let the panel fall back to its defaults, rather than logging
-    # a 5xx in the browser on every composer load.
-    def _unavailable(reason):
-        return JsonResponse(
-            {
-                "available": False,
-                "error": reason,
-                "creator_nickname": "",
-                "privacy_level_options": [],
-                "comment_disabled": False,
-                "duet_disabled": False,
-                "stitch_disabled": False,
-                "max_video_post_duration_sec": None,
-            }
-        )
-
-    # Refresh token if expiring
-    access_token = account.oauth_access_token
-    if account.token_expires_at and account.is_token_expiring_soon:
-        try:
-            access_token = account.refresh_oauth_token(provider)
-        except Exception:
-            return _unavailable("Token refresh failed")
-
-    try:
-        info = provider.query_creator_info(access_token)
-    except Exception:
-        return _unavailable("Failed to fetch creator info")
-
-    return JsonResponse(
-        {
-            "available": True,
-            "creator_nickname": info.get("creator_nickname", ""),
-            "privacy_level_options": info.get("privacy_level_options") or [],
-            "comment_disabled": bool(info.get("comment_disabled")),
-            "duet_disabled": bool(info.get("duet_disabled")),
-            "stitch_disabled": bool(info.get("stitch_disabled")),
-            "max_video_post_duration_sec": info.get("max_video_post_duration_sec"),
-        }
-    )
-
-
 @login_required
 @require_POST
 def attach_media(request, workspace_id, post_id):
@@ -1899,7 +938,7 @@ def attach_media(request, workspace_id, post_id):
     )
 
     # Option A: changing media on an approved post sends it back for re-approval.
-    _revert_approved_to_review(post)
+    editor.revert_approved_to_review(post)
 
     response = render(
         request,
@@ -2029,7 +1068,7 @@ def upload_media(request, workspace_id, post_id=None):
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
         attachment = _attach_asset_for_composer(request, workspace, asset, post)
         # Option A: changing media on an approved post sends it back for re-approval.
-        _revert_approved_to_review(post)
+        editor.revert_approved_to_review(post)
         response = render(
             request,
             "composer/partials/media_list.html",
@@ -2064,7 +1103,7 @@ def remove_media(request, workspace_id, post_id, media_id):
     PostMedia.objects.filter(id=media_id, post=post).delete()
 
     # Option A: changing media on an approved post sends it back for re-approval.
-    _revert_approved_to_review(post)
+    editor.revert_approved_to_review(post)
 
     response = render(
         request,
@@ -2214,119 +1253,6 @@ def clone_post_view(request, workspace_id, post_id):
 # ---------------------------------------------------------------------------
 
 
-def _idea_columns(workspace, tag=None):
-    """Build Kanban columns from IdeaGroup for a workspace, optionally filtered by tag."""
-    groups = IdeaGroup.objects.for_workspace(workspace.id).order_by("position", "created_at")
-
-    # Ensure default groups exist for this workspace
-    if not groups.exists():
-        created_groups = {}
-        for name, pos in [("Unassigned", 0), ("To Do", 1), ("In Progress", 2), ("Done", 3)]:
-            created_groups[name] = IdeaGroup.objects.create(workspace=workspace, name=name, position=pos)
-        # Seed an introductory idea in the Unassigned column
-        Idea.objects.create(
-            workspace=workspace,
-            group=created_groups["Unassigned"],
-            title="This is a place to plan \u270d\ufe0f your content",
-            description="Save your Ideas before converting them into posts. Brainstorm, plan ahead, and keep everything organized in one place.",
-            status=Idea.Status.UNASSIGNED,
-            position=0,
-        )
-        groups = IdeaGroup.objects.for_workspace(workspace.id).order_by("position", "created_at")
-
-    ideas_qs = (
-        Idea.objects.for_workspace(workspace.id)
-        .select_related("author", "media_asset")
-        .prefetch_related("media_attachments__media_asset")
-        .order_by("position", "-created_at")
-    )
-    if tag:
-        ideas_qs = ideas_qs.filter(tags__contains=[tag])
-
-    grouped_ideas = {str(grp.id): [] for grp in groups}
-    for idea in ideas_qs:
-        _prepare_idea_for_kanban(idea)
-
-        group_key = str(idea.group_id) if idea.group_id else ""
-        if group_key in grouped_ideas:
-            grouped_ideas[group_key].append(idea)
-
-    columns = []
-    for grp in groups:
-        columns.append(
-            {
-                "id": str(grp.id),
-                "key": str(grp.id),
-                "label": grp.name,
-                "ideas": grouped_ideas.get(str(grp.id), []),
-            }
-        )
-
-    # All workspace tags from the Tag model
-    all_tags = list(Tag.objects.for_workspace(workspace.id).values_list("name", flat=True))
-
-    return columns, all_tags
-
-
-def _parse_media_asset_ids(raw_ids):
-    """Parse ordered media ids from CSV, preserving order and removing duplicates."""
-    ordered = []
-    seen = set()
-    for token in (raw_ids or "").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            normalized = str(uuid.UUID(token))
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        ordered.append(normalized)
-    return ordered
-
-
-def _build_idea_media_payload(idea):
-    """Build ordered media payload and attachment list for Kanban rendering."""
-    attachments = [att for att in idea.media_attachments.all() if att.media_asset_id and att.media_asset]
-    media_payload = []
-    for att in attachments:
-        asset = att.media_asset
-        media_payload.append(
-            {
-                "asset_id": str(asset.id),
-                "url": asset.file.url if asset.file else "",
-                "filename": asset.filename,
-                "media_type": asset.media_type,
-                "position": att.position,
-            }
-        )
-
-    # Legacy fallback for ideas that only have the old single media pointer.
-    if not media_payload and idea.media_asset_id and idea.media_asset:
-        media_payload.append(
-            {
-                "asset_id": str(idea.media_asset_id),
-                "url": idea.media_asset.file.url if idea.media_asset.file else "",
-                "filename": idea.media_asset.filename,
-                "media_type": idea.media_asset.media_type,
-                "position": 0,
-            }
-        )
-    return media_payload, attachments
-
-
-def _prepare_idea_for_kanban(idea):
-    """Attach computed media/tag fields used by Kanban templates."""
-    media_payload, attachments = _build_idea_media_payload(idea)
-    idea.media_payload_json = json.dumps(media_payload)
-    idea.tags_payload_json = json.dumps(idea.tags or [])
-    idea.media_count = len(media_payload)
-    idea.cover_media = attachments[0].media_asset if attachments else idea.media_asset
-    return idea
-
-
 def _render_idea_card_fragment(request, idea):
     """Render a single Kanban idea card fragment."""
     _prepare_idea_for_kanban(idea)
@@ -2362,99 +1288,6 @@ def _wants_json_response(request):
     return "application/json" in accept.lower()
 
 
-def _normalize_media_asset_ids(raw_ids="", extra_ids=None):
-    """Normalize media IDs from mixed inputs while preserving first-seen order."""
-    chunks = []
-    if isinstance(raw_ids, str):
-        chunks.append(raw_ids)
-    elif raw_ids:
-        chunks.extend(str(item) for item in raw_ids)
-    if extra_ids:
-        chunks.extend(str(item) for item in extra_ids)
-    return _parse_media_asset_ids(",".join(chunks))
-
-
-def _sync_idea_media_attachments(idea, workspace, ordered_asset_ids):
-    """Synchronize IdeaMedia rows to match ordered ids and keep cover pointer aligned."""
-    from apps.media_library.models import MediaAsset
-
-    normalized_ids = _normalize_media_asset_ids(ordered_asset_ids)
-    if normalized_ids:
-        valid_assets = set(
-            str(aid)
-            for aid in MediaAsset.objects.filter(workspace=workspace, id__in=normalized_ids).values_list(
-                "id", flat=True
-            )
-        )
-        ordered_ids = [aid for aid in normalized_ids if aid in valid_assets]
-    else:
-        ordered_ids = []
-
-    existing_attachments = list(idea.media_attachments.all())
-    existing = {str(att.media_asset_id): att for att in existing_attachments}
-    ids_to_keep = set(ordered_ids)
-    ids_to_delete = [att.id for att in existing_attachments if str(att.media_asset_id) not in ids_to_keep]
-    if ids_to_delete:
-        IdeaMedia.objects.filter(id__in=ids_to_delete).delete()
-
-    to_create = []
-    to_update = []
-    now = timezone.now()
-    for position, asset_id in enumerate(ordered_ids):
-        attachment = existing.get(asset_id)
-        if attachment:
-            if attachment.position != position:
-                attachment.position = position
-                attachment.updated_at = now
-                to_update.append(attachment)
-            continue
-        to_create.append(
-            IdeaMedia(
-                idea=idea,
-                media_asset_id=asset_id,
-                position=position,
-            )
-        )
-
-    if to_create:
-        IdeaMedia.objects.bulk_create(to_create)
-    if to_update:
-        IdeaMedia.objects.bulk_update(to_update, ["position", "updated_at"])
-
-    cover_id = ordered_ids[0] if ordered_ids else None
-    current_cover_id = str(idea.media_asset_id) if idea.media_asset_id else None
-    if current_cover_id != cover_id:
-        idea.media_asset_id = cover_id
-        idea.save(update_fields=["media_asset", "updated_at"])
-
-
-def _create_idea_media_asset(workspace, user, uploaded_file):
-    """Create a MediaAsset from an uploaded file for Idea create/edit flows."""
-    from apps.media_library.models import MediaAsset
-
-    content_type = uploaded_file.content_type or ""
-    if content_type == "image/gif":
-        media_type = MediaAsset.MediaType.GIF
-    elif content_type.startswith("image/"):
-        media_type = MediaAsset.MediaType.IMAGE
-    elif content_type.startswith("video/"):
-        media_type = MediaAsset.MediaType.VIDEO
-    else:
-        media_type = MediaAsset.MediaType.DOCUMENT
-
-    return MediaAsset.objects.create(
-        organization=workspace.organization,
-        workspace=workspace,
-        uploaded_by=user,
-        file=uploaded_file,
-        filename=uploaded_file.name,
-        media_type=media_type,
-        mime_type=content_type,
-        file_size=uploaded_file.size,
-        source="upload",
-    )
-
-
 @login_required
 @require_permission("create_posts")
 def create_landing(request, workspace_id):
@@ -2485,28 +1318,6 @@ def create_landing(request, workspace_id):
         "feeds": feeds,
     }
     return render(request, "composer/create_landing.html", context)
-
-
-@login_required
-@require_permission("create_posts")
-@require_POST
-def idea_upload_media(request, workspace_id):
-    """Upload media for Idea modals and return an asset id for reliable save binding."""
-    workspace = _get_workspace(request, workspace_id)
-    uploaded_file = request.FILES.get("file") or request.FILES.get("media")
-    if not uploaded_file:
-        return JsonResponse({"error": "No file provided"}, status=400)
-
-    asset = _create_idea_media_asset(workspace, request.user, uploaded_file)
-    return JsonResponse(
-        {
-            "asset_id": str(asset.id),
-            "filename": asset.filename,
-            "url": asset.file.url if asset.file else "",
-            "size": asset.file_size,
-            "media_type": asset.media_type,
-        }
-    )
 
 
 @login_required
@@ -2564,7 +1375,7 @@ def idea_create(request, workspace_id):
             _sync_idea_media_attachments(idea, workspace, media_asset_ids)
 
     # Sync any new tags to the Tag model
-    _sync_tags_to_model(workspace, tags)
+    editor.sync_tags_to_model(workspace, tags)
 
     if _wants_json_response(request):
         idea = (
@@ -2641,7 +1452,7 @@ def idea_edit(request, workspace_id, idea_id):
                 _sync_idea_media_attachments(idea, workspace, [])
 
     # Sync any new tags to the Tag model
-    _sync_tags_to_model(workspace, idea.tags)
+    editor.sync_tags_to_model(workspace, idea.tags)
 
     if _wants_json_response(request):
         idea = (
@@ -2664,91 +1475,6 @@ def idea_edit(request, workspace_id, idea_id):
     return HttpResponse(
         status=204,
         headers={"HX-Trigger": "ideaChanged"},
-    )
-
-
-@login_required
-@require_permission("create_posts")
-@require_POST
-def idea_create_post(request, workspace_id, idea_id):
-    """Create a new draft post from an idea and return composer redirect metadata."""
-    workspace = _get_workspace(request, workspace_id)
-    idea = get_object_or_404(
-        Idea.objects.for_workspace(workspace.id)
-        .select_related("media_asset")
-        .prefetch_related("media_attachments__media_asset"),
-        id=idea_id,
-    )
-
-    tags = []
-    if isinstance(idea.tags, list):
-        tags = [tag.strip() for tag in idea.tags if isinstance(tag, str) and tag.strip()]
-
-    ordered_media_asset_ids = []
-    seen_media_ids = set()
-    for attachment in idea.media_attachments.all():
-        if not attachment.media_asset_id:
-            continue
-        media_id = str(attachment.media_asset_id)
-        if media_id in seen_media_ids:
-            continue
-        seen_media_ids.add(media_id)
-        ordered_media_asset_ids.append(media_id)
-
-    # Legacy fallback: old ideas may only have the single media pointer set.
-    if not ordered_media_asset_ids and idea.media_asset_id:
-        ordered_media_asset_ids.append(str(idea.media_asset_id))
-
-    connected_accounts = list(
-        SocialAccount.objects.for_workspace(workspace.id)
-        .filter(connection_status=SocialAccount.ConnectionStatus.CONNECTED)
-        .order_by("platform", "account_name", "id")
-    )
-
-    with transaction.atomic():
-        post = Post.objects.create(
-            workspace=workspace,
-            author=request.user,
-            title=idea.title or "",
-            caption=idea.description or "",
-            tags=tags,
-        )
-
-        if ordered_media_asset_ids:
-            PostMedia.objects.bulk_create(
-                [
-                    PostMedia(
-                        post=post,
-                        media_asset_id=asset_id,
-                        position=index,
-                    )
-                    for index, asset_id in enumerate(ordered_media_asset_ids)
-                ]
-            )
-
-        if connected_accounts:
-            PlatformPost.objects.bulk_create(
-                [
-                    PlatformPost(
-                        post=post,
-                        social_account=account,
-                    )
-                    for account in connected_accounts
-                ]
-            )
-
-        idea.post = post
-        idea.save(update_fields=["post", "updated_at"])
-
-    from django.urls import reverse
-
-    compose_url = reverse("composer:compose_edit", kwargs={"workspace_id": workspace.id, "post_id": post.id})
-    return JsonResponse(
-        {
-            "ok": True,
-            "post_id": str(post.id),
-            "compose_url": compose_url,
-        }
     )
 
 
@@ -3089,300 +1815,9 @@ def use_template(request, workspace_id, template_id):
 # ---------------------------------------------------------------------------
 
 
-@login_required
-@require_permission("create_posts")
-def csv_upload(request, workspace_id):
-    """Render CSV upload page or handle file upload and show column mapping."""
-    workspace = _get_workspace(request, workspace_id)
-
-    if request.method == "POST" and request.FILES.get("csv_file"):
-        import csv
-        import io
-
-        csv_file = request.FILES["csv_file"]
-        if csv_file.size and csv_file.size > MAX_CSV_UPLOAD_BYTES:
-            return render(
-                request,
-                "composer/csv_import.html",
-                {"workspace": workspace, "error": "CSV file too large (max 5 MB)."},
-            )
-        decoded = csv_file.read().decode("utf-8-sig")
-        reader = csv.reader(io.StringIO(decoded))
-        rows = list(reader)
-
-        if not rows:
-            return render(
-                request,
-                "composer/csv_import.html",
-                {"workspace": workspace, "error": "CSV file is empty."},
-            )
-
-        headers = rows[0]
-        preview_rows = rows[1:6]  # First 5 data rows
-
-        # Auto-detect column mapping
-        field_map = {
-            "date": ["date", "publish_date", "scheduled_date"],
-            "time": ["time", "publish_time", "scheduled_time"],
-            "platforms": ["platform", "platforms", "channel", "channels"],
-            "caption": ["caption", "text", "content", "message", "body"],
-            "media_url": ["media_url", "media", "image_url", "image", "video_url"],
-            "category": ["category", "content_category", "type"],
-            "tags": ["tags", "labels", "tag"],
-            "first_comment": ["first_comment", "comment"],
-        }
-
-        auto_mapping = {}
-        for col_idx, header in enumerate(headers):
-            header_lower = header.strip().lower().replace(" ", "_")
-            for field, aliases in field_map.items():
-                if header_lower in aliases:
-                    auto_mapping[field] = col_idx
-                    break
-
-        # Store CSV in session for the next step
-        request.session[f"csv_import_{workspace.id}"] = {
-            "headers": headers,
-            "rows": rows[1:],  # Exclude header
-            "filename": csv_file.name,
-        }
-
-        return render(
-            request,
-            "composer/partials/csv_mapping.html",
-            {
-                "workspace": workspace,
-                "headers": headers,
-                "preview_rows": preview_rows,
-                "auto_mapping": auto_mapping,
-                "field_choices": list(field_map.keys()),
-            },
-        )
-
-    return render(
-        request,
-        "composer/csv_import.html",
-        {"workspace": workspace},
-    )
-
-
-@login_required
-@require_permission("create_posts")
-@require_POST
-def csv_preview(request, workspace_id):
-    """Validate CSV rows with the selected column mapping and show preview."""
-    workspace = _get_workspace(request, workspace_id)
-    csv_data = request.session.get(f"csv_import_{workspace.id}")
-
-    if not csv_data:
-        return HttpResponse("No CSV data found. Please upload again.", status=400)
-
-    # Parse column mapping from POST
-    mapping = {}
-    for field in ["date", "time", "platforms", "caption", "media_url", "category", "tags", "first_comment"]:
-        col_idx = request.POST.get(f"map_{field}", "")
-        if col_idx != "":
-            import contextlib
-
-            with contextlib.suppress(ValueError, TypeError):
-                mapping[field] = int(col_idx)
-
-    rows = csv_data["rows"]
-    errors = []
-    valid_count = 0
-
-    from apps.social_accounts.models import SocialAccount
-
-    valid_platforms = {p[0].lower() for p in SocialAccount.Platform.choices}
-    connected_accounts = set(
-        SocialAccount.objects.for_workspace(workspace.id)
-        .filter(connection_status=SocialAccount.ConnectionStatus.CONNECTED)
-        .values_list("platform", flat=True)
-    )
-
-    for row_idx, row in enumerate(rows, start=2):  # Row 2 = first data row
-        row_errors = []
-
-        # Validate date
-        if "date" in mapping:
-            date_val = row[mapping["date"]].strip() if mapping["date"] < len(row) else ""
-            if date_val:
-                try:
-                    from datetime import date as date_cls
-
-                    date_cls.fromisoformat(date_val)
-                except ValueError:
-                    row_errors.append(f"Invalid date format '{date_val}' (expected YYYY-MM-DD)")
-            else:
-                row_errors.append("Date is empty")
-
-        # Validate platforms
-        if "platforms" in mapping:
-            platforms_val = row[mapping["platforms"]].strip() if mapping["platforms"] < len(row) else ""
-            if platforms_val:
-                for p in platforms_val.split(","):
-                    p = p.strip().lower()
-                    if p and p not in valid_platforms:
-                        row_errors.append(f"Unknown platform '{p}'")
-                    elif p and p not in connected_accounts:
-                        row_errors.append(f"Platform '{p}' is not connected")
-
-        # Validate caption
-        if "caption" in mapping:
-            caption_val = row[mapping["caption"]].strip() if mapping["caption"] < len(row) else ""
-            if not caption_val:
-                row_errors.append("Caption is empty")
-
-        if row_errors:
-            errors.append({"row": row_idx, "errors": row_errors})
-        else:
-            valid_count += 1
-
-    # Store mapping in session
-    request.session[f"csv_mapping_{workspace.id}"] = mapping
-
-    return render(
-        request,
-        "composer/partials/csv_validation.html",
-        {
-            "workspace": workspace,
-            "total_rows": len(rows),
-            "valid_count": valid_count,
-            "errors": errors[:50],  # Show max 50 errors
-            "has_more_errors": len(errors) > 50,
-        },
-    )
-
-
-@login_required
-@require_permission("create_posts")
-@require_POST
-def csv_confirm_import(request, workspace_id):
-    """Kick off the CSV import as a background job."""
-    workspace = _get_workspace(request, workspace_id)
-    csv_data = request.session.get(f"csv_import_{workspace.id}")
-    mapping = request.session.get(f"csv_mapping_{workspace.id}")
-
-    if not csv_data or not mapping:
-        return HttpResponse("No CSV data found. Please upload again.", status=400)
-
-    from apps.social_accounts.models import SocialAccount
-
-    rows = csv_data["rows"]
-    created_count = 0
-    error_count = 0
-
-    for row in rows:
-        try:
-            caption = row[mapping["caption"]].strip() if "caption" in mapping and mapping["caption"] < len(row) else ""
-            if not caption:
-                error_count += 1
-                continue
-
-            post = Post(
-                workspace=workspace,
-                author=request.user,
-                caption=caption,
-            )
-            initial_pp_status = "draft"
-
-            # Date + time
-            if "date" in mapping and mapping["date"] < len(row):
-                date_str = row[mapping["date"]].strip()
-                time_str = ""
-                if "time" in mapping and mapping["time"] < len(row):
-                    time_str = row[mapping["time"]].strip()
-
-                if date_str:
-                    import zoneinfo
-
-                    ws_tz = workspace.effective_timezone or "UTC"
-                    tz = zoneinfo.ZoneInfo(ws_tz)
-                    from datetime import time as time_cls
-
-                    d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    t = datetime.strptime(time_str, "%H:%M").time() if time_str else time_cls(9, 0)
-                    naive_dt = datetime.combine(d, t)
-                    post.scheduled_at = naive_dt.replace(tzinfo=tz)
-                    initial_pp_status = "scheduled"
-
-            # First comment
-            if "first_comment" in mapping and mapping["first_comment"] < len(row):
-                post.first_comment = row[mapping["first_comment"]].strip()
-
-            # Tags
-            if "tags" in mapping and mapping["tags"] < len(row):
-                tags_raw = row[mapping["tags"]].strip()
-                if tags_raw:
-                    post.tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
-
-            # Category
-            if "category" in mapping and mapping["category"] < len(row):
-                cat_name = row[mapping["category"]].strip()
-                if cat_name:
-                    cat, _ = ContentCategory.objects.get_or_create(
-                        workspace=workspace,
-                        name=cat_name,
-                        defaults={"color": "#3B82F6"},
-                    )
-                    post.category = cat
-
-            post.save()
-
-            # Platforms
-            if "platforms" in mapping and mapping["platforms"] < len(row):
-                platforms_str = row[mapping["platforms"]].strip()
-                if platforms_str:
-                    for p in platforms_str.split(","):
-                        p = p.strip().lower()
-                        accounts = SocialAccount.objects.filter(
-                            workspace=workspace,
-                            platform=p,
-                            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
-                        )
-                        for acc in accounts:
-                            PlatformPost.objects.get_or_create(
-                                post=post,
-                                social_account=acc,
-                                defaults={
-                                    "status": initial_pp_status,
-                                    "scheduled_at": post.scheduled_at,
-                                },
-                            )
-
-            created_count += 1
-        except Exception:
-            error_count += 1
-
-    # Clean up session data
-    request.session.pop(f"csv_import_{workspace.id}", None)
-    request.session.pop(f"csv_mapping_{workspace.id}", None)
-
-    return render(
-        request,
-        "composer/partials/csv_progress.html",
-        {
-            "workspace": workspace,
-            "created_count": created_count,
-            "error_count": error_count,
-            "total_rows": len(rows),
-        },
-    )
-
-
 # ---------------------------------------------------------------------------
 # Tag CRUD (JSON API endpoints)
 # ---------------------------------------------------------------------------
-
-
-def _sync_tags_to_model(workspace, tag_names):
-    """Ensure Tag records exist for all given tag names in a workspace."""
-    if not tag_names:
-        return
-    existing = set(Tag.objects.for_workspace(workspace.id).filter(name__in=tag_names).values_list("name", flat=True))
-    new_tags = [Tag(workspace=workspace, name=name) for name in tag_names if name not in existing]
-    if new_tags:
-        Tag.objects.bulk_create(new_tags, ignore_conflicts=True)
 
 
 @login_required
@@ -3413,369 +1848,222 @@ def tag_create(request, workspace_id):
 # ── Feeds ──────────────────────────────────────────────────────────────────
 
 
-FEED_EVENTS_PAGE_SIZE = 15
-FEED_EVENTS_CACHE_TTL_SECONDS = 10 * 60
-_IMG_SRC_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
+# ---------------------------------------------------------------------------
+# Ideas, feeds, Unsplash, platform lookups and CSV import delegate to the
+# composer service modules shared with the web API.
+# ---------------------------------------------------------------------------
+
+MAX_CSV_UPLOAD_BYTES = csv_import.MAX_UPLOAD_BYTES
+_validate_rss_url = feeds.validate_rss_url
 
 
-def _feed_events_cache_key(workspace_id):
-    return f"composer:feed-events:{workspace_id}"
+def _prepare_idea_for_kanban(idea):
+    """Attach computed media/tag fields used by Kanban templates."""
+    media_payload = ideas.idea_media(idea)
+    idea.media_payload_json = json.dumps(media_payload)
+    idea.tags_payload_json = json.dumps(idea.tags or [])
+    idea.media_count = len(media_payload)
+    attachments = [att for att in idea.media_attachments.all() if att.media_asset_id and att.media_asset]
+    idea.cover_media = attachments[0].media_asset if attachments else idea.media_asset
+    return idea
 
 
-def _normalize_selected_feed_id(selected_feed_id, feeds):
-    valid_feed_ids = {str(feed.id) for feed in feeds}
-    if selected_feed_id in valid_feed_ids:
-        return selected_feed_id
-    return "all"
+def _idea_columns(workspace, tag=None):
+    columns, all_tags = ideas.columns(workspace, tag)
+    for col in columns:
+        for idea in col["ideas"]:
+            _prepare_idea_for_kanban(idea)
+    return columns, all_tags
 
 
-def _coerce_positive_int(value, default=0):
+_normalize_media_asset_ids = ideas.normalize_media_ids
+_sync_idea_media_attachments = ideas.sync_media
+_create_idea_media_asset = ideas.create_media_asset
+
+
+@login_required
+@require_permission("create_posts")
+@require_POST
+def idea_upload_media(request, workspace_id):
+    """Upload media for Idea modals and return an asset id for reliable save binding."""
+    workspace = _get_workspace(request, workspace_id)
+    uploaded_file = request.FILES.get("file") or request.FILES.get("media")
+    if not uploaded_file:
+        return JsonResponse({"error": "No file provided"}, status=400)
+    asset = ideas.create_media_asset(workspace, request.user, uploaded_file)
+    return JsonResponse(
+        {
+            "asset_id": str(asset.id),
+            "filename": asset.filename,
+            "url": asset.file.url if asset.file else "",
+            "size": asset.file_size,
+            "media_type": asset.media_type,
+        }
+    )
+
+
+@login_required
+@require_permission("create_posts")
+@require_POST
+def idea_create_post(request, workspace_id, idea_id):
+    """Create a new draft post from an idea and return composer redirect metadata."""
+    from django.urls import reverse
+
+    workspace = _get_workspace(request, workspace_id)
+    idea = get_object_or_404(
+        Idea.objects.for_workspace(workspace.id)
+        .select_related("media_asset")
+        .prefetch_related("media_attachments__media_asset"),
+        id=idea_id,
+    )
+    post = ideas.create_post_from_idea(idea, workspace, request.user)
+    compose_url = reverse("composer:compose_edit", kwargs={"workspace_id": workspace.id, "post_id": post.id})
+    return JsonResponse({"ok": True, "post_id": str(post.id), "compose_url": compose_url})
+
+
+@login_required
+@require_GET
+def unsplash_search(request, workspace_id):
+    """Proxy an Unsplash photo search so the API key stays server-side."""
+    _get_workspace(request, workspace_id)
     try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= 0 else default
+        return JsonResponse(unsplash.search(request.GET.get("q", "")))
+    except unsplash.UnsplashError as exc:
+        return JsonResponse({"error": exc.message}, status=exc.status)
 
 
-def _xml_local_name(tag):
-    """Return local XML tag name without namespace."""
-    if not tag:
-        return ""
-    if "}" in tag:
-        return tag.rsplit("}", 1)[-1].lower()
-    if ":" in tag:
-        return tag.split(":", 1)[-1].lower()
-    return tag.lower()
-
-
-def _first_child(element, *names):
-    wanted = {name.lower() for name in names}
-    for child in element:
-        if _xml_local_name(child.tag) in wanted:
-            return child
-    return None
-
-
-def _first_child_text(element, *names):
-    child = _first_child(element, *names)
-    if child is None:
-        return ""
-    return (child.text or "").strip()
-
-
-def _extract_atom_link(entry):
-    for child in entry:
-        if _xml_local_name(child.tag) != "link":
-            continue
-        href = (child.attrib.get("href") or "").strip()
-        rel = (child.attrib.get("rel") or "").strip().lower()
-        if href and rel in ("", "alternate"):
-            return href
-    for child in entry:
-        if _xml_local_name(child.tag) != "link":
-            continue
-        href = (child.attrib.get("href") or "").strip()
-        if href:
-            return href
-    return ""
-
-
-def _extract_image_url(entry, summary_raw):
-    for node in entry.iter():
-        name = _xml_local_name(node.tag)
-        if name not in {"thumbnail", "content", "enclosure"}:
-            continue
-        url = (node.attrib.get("url") or node.attrib.get("href") or node.attrib.get("src") or "").strip()
-        media_type = (node.attrib.get("type") or "").lower()
-        medium = (node.attrib.get("medium") or "").lower()
-        if url and (name == "thumbnail" or medium == "image" or media_type.startswith("image/") or not media_type):
-            return url
-
-    if summary_raw:
-        match = _IMG_SRC_RE.search(summary_raw)
-        if match:
-            return match.group(1)
-    return ""
-
-
-def _clean_summary(raw_summary):
-    if not raw_summary:
-        return ""
-    return re.sub(r"\s+", " ", strip_tags(raw_summary)).strip()
-
-
-def _parse_published_at(raw_value):
-    if not raw_value:
-        return None
-    with contextlib.suppress(ValueError, TypeError, OverflowError):
-        parsed = date_parser.parse(raw_value)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
-    return None
-
-
-def _parse_feed_document(xml_content):
-    """Parse RSS/Atom document into metadata and raw entries.
-
-    Uses safe_xml_fromstring to bound size and reject DTD/entity-bearing
-    payloads (billion-laughs defence).
-    """
-    if isinstance(xml_content, str):
-        xml_content = xml_content.encode("utf-8", errors="replace")
-    root = safe_xml_fromstring(xml_content)
-    if root is None:
-        return None
-
-    root_name = _xml_local_name(root.tag)
-    if root_name == "rss":
-        channel = _first_child(root, "channel")
-        if channel is None:
-            return None
-        entries = [child for child in channel if _xml_local_name(child.tag) == "item"]
-        return {
-            "title": _first_child_text(channel, "title"),
-            "website_url": _first_child_text(channel, "link"),
-            "entries": entries,
-            "entry_kind": "rss",
-        }
-
-    if root_name == "feed":
-        entries = [child for child in root if _xml_local_name(child.tag) == "entry"]
-        return {
-            "title": _first_child_text(root, "title"),
-            "website_url": _extract_atom_link(root),
-            "entries": entries,
-            "entry_kind": "atom",
-        }
-
-    if root_name == "rdf":
-        channel = _first_child(root, "channel")
-        entries = [child for child in root if _xml_local_name(child.tag) == "item"]
-        return {
-            "title": _first_child_text(channel, "title") if channel is not None else "",
-            "website_url": _first_child_text(channel, "link") if channel is not None else "",
-            "entries": entries,
-            "entry_kind": "rss",
-        }
-
-    return None
-
-
-def _build_event_from_entry(feed, parsed_feed, entry):
-    kind = parsed_feed["entry_kind"]
-    if kind == "atom":
-        raw_title = _first_child_text(entry, "title")
-        raw_link = _extract_atom_link(entry)
-        raw_summary = _first_child_text(entry, "summary") or _first_child_text(entry, "content")
-        raw_published = (
-            _first_child_text(entry, "published")
-            or _first_child_text(entry, "updated")
-            or _first_child_text(entry, "issued")
+@login_required
+@require_POST
+def unsplash_import(request, workspace_id, post_id=None):
+    """Download selected Unsplash photos server-side and attach them as media."""
+    workspace = _get_workspace(request, workspace_id)
+    if not unsplash.enabled():
+        return JsonResponse({"error": unsplash.NOT_CONFIGURED}, status=503)
+    try:
+        photos = json.loads(request.body)["photos"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return JsonResponse({"error": "Invalid request body"}, status=400)
+    post = get_object_or_404(Post, id=post_id, workspace=workspace) if post_id else None
+    try:
+        new_assets, failed = unsplash.import_photos(workspace, request.user, photos)
+    except unsplash.UnsplashError as exc:
+        return JsonResponse({"error": exc.message}, status=exc.status)
+    attachments = [
+        a for a in (_attach_asset_for_composer(request, workspace, asset, post) for asset in new_assets) if a
+    ]
+    if post is not None:
+        html = render_to_string(
+            "composer/partials/media_list.html",
+            {"media_attachments": attachments, "post": post, "workspace": workspace},
+            request=request,
         )
     else:
-        raw_title = _first_child_text(entry, "title")
-        raw_link = _first_child_text(entry, "link")
-        raw_summary = (
-            _first_child_text(entry, "description")
-            or _first_child_text(entry, "summary")
-            or _first_child_text(entry, "content")
+        html = render_to_string(
+            "composer/partials/media_list_pending.html",
+            {"pending_assets": new_assets, "workspace": workspace},
+            request=request,
         )
-        raw_published = (
-            _first_child_text(entry, "pubDate")
-            or _first_child_text(entry, "published")
-            or _first_child_text(entry, "updated")
-            or _first_child_text(entry, "date")
-        )
-
-    title = raw_title or parsed_feed["title"] or feed.name or "Untitled"
-    link = raw_link or parsed_feed["website_url"] or feed.website_url
-    summary = _clean_summary(raw_summary)
-    image_url = _extract_image_url(entry, raw_summary)
-    published_at = _parse_published_at(raw_published)
-    event_id = (link or f"{feed.id}:{title}:{raw_published}").strip()
-    return {
-        "event_id": event_id,
-        "feed_id": str(feed.id),
-        "feed_name": feed.name,
-        "feed_favicon_url": feed.favicon_url,
-        "feed_website_url": feed.website_url or parsed_feed["website_url"],
-        "title": title,
-        "link": link,
-        "summary": summary,
-        "image_url": image_url,
-        "published_at": published_at,
-    }
+    return JsonResponse(
+        {"html": html, "assets": [{"id": str(a.id), "url": a.file.url} for a in new_assets], "failed": failed}
+    )
 
 
-def _safe_fetch_feed(url, headers, *, timeout=8.0, max_redirects=5):
-    """Fetch *url* with manual redirect handling, re-validating each hop with
-    is_safe_url. Returns (response, final_url) on success or (None, None) on
-    any reject path (initial-URL failed SSRF check, intermediate hop failed
-    SSRF check, broken redirect, transport error).
-    """
-    if not is_safe_url(url):
-        return None, None
-    current_url = url
+@login_required
+@require_GET
+def pinterest_boards(request, workspace_id, account_id):
+    """Fetch Pinterest boards for board selection in the composer."""
+    workspace = _get_workspace(request, workspace_id)
+    account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace, platform="pinterest")
     try:
-        response = httpx.get(current_url, headers=headers, timeout=timeout, follow_redirects=False)
-    except httpx.RequestError:
-        return None, None
-    for _ in range(max_redirects):
-        if response.status_code not in (301, 302, 303, 307, 308):
-            return response, current_url
-        location = response.headers.get("Location")
-        if not location:
-            return None, None
-        next_url = urljoin(current_url, location)
-        if not is_safe_url(next_url):
-            return None, None
+        return JsonResponse({"boards": platform_info.pinterest_boards(workspace, account)})
+    except RuntimeError as exc:
+        return JsonResponse({"error": str(exc)}, status=502)
+
+
+@login_required
+@require_GET
+def tiktok_creator_info(request, workspace_id, account_id):
+    """Fetch TikTok creator info for the composer's TikTok settings panel."""
+    workspace = _get_workspace(request, workspace_id)
+    account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace, platform="tiktok")
+    return JsonResponse(platform_info.tiktok_creator_info(workspace, account))
+
+
+@login_required
+@require_permission("create_posts")
+def csv_upload(request, workspace_id):
+    """Render CSV upload page or handle file upload and show column mapping."""
+    workspace = _get_workspace(request, workspace_id)
+    if request.method == "POST" and request.FILES.get("csv_file"):
+        csv_file = request.FILES["csv_file"]
         try:
-            response = httpx.get(next_url, headers=headers, timeout=timeout, follow_redirects=False)
-        except httpx.RequestError:
-            return None, None
-        current_url = next_url
-    # Too many redirects.
-    return None, None
+            headers, rows = csv_import.parse_upload(csv_file)
+        except ValueError as exc:
+            return render(request, "composer/csv_import.html", {"workspace": workspace, "error": str(exc)})
+        request.session[f"csv_import_{workspace.id}"] = {"headers": headers, "rows": rows, "filename": csv_file.name}
+        return render(
+            request,
+            "composer/partials/csv_mapping.html",
+            {
+                "workspace": workspace,
+                "headers": headers,
+                "preview_rows": rows[:5],
+                "auto_mapping": csv_import.auto_mapping(headers),
+                "field_choices": csv_import.FIELDS,
+            },
+        )
+    return render(request, "composer/csv_import.html", {"workspace": workspace})
 
 
-def _fetch_feed_events_for_workspace(feeds):
-    """Fetch and aggregate recent events across all workspace feeds.
-
-    Each feed is re-validated against is_safe_url at fetch time (not just at
-    add time), and redirects are followed manually with per-hop SSRF checks.
-    This closes the DNS-rebind / redirect-bait window that would otherwise
-    let a previously-valid feed URL reach internal hosts on subsequent polls.
-    """
-    if not feeds:
-        return []
-
-    headers = {
-        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.1",
-        "User-Agent": "Osir AI RSS Reader/1.0",
-    }
-    all_events = []
-    for feed in feeds:
-        response, _final_url = _safe_fetch_feed(feed.url, headers)
-        if response is None or response.status_code >= 400:
-            continue
-        parsed_feed = _parse_feed_document(response.content)
-        if not parsed_feed:
-            continue
-        for entry in parsed_feed["entries"][:50]:
-            all_events.append(_build_event_from_entry(feed, parsed_feed, entry))
-
-    deduped_events = []
-    seen = set()
-    for event in all_events:
-        dedupe_key = (event["feed_id"], event["event_id"])
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        deduped_events.append(event)
-
-    deduped_events.sort(
-        key=lambda event: event["published_at"] or datetime(1970, 1, 1, tzinfo=UTC),
-        reverse=True,
-    )
-    return deduped_events
+@login_required
+@require_permission("create_posts")
+@require_POST
+def csv_preview(request, workspace_id):
+    """Validate CSV rows with the selected column mapping and show preview."""
+    workspace = _get_workspace(request, workspace_id)
+    csv_data = request.session.get(f"csv_import_{workspace.id}")
+    if not csv_data:
+        return HttpResponse("No CSV data found. Please upload again.", status=400)
+    mapping = csv_import.clean_mapping({f: request.POST.get(f"map_{f}", "") for f in csv_import.FIELDS})
+    request.session[f"csv_mapping_{workspace.id}"] = mapping
+    context = csv_import.validate_rows(workspace, csv_data["rows"], mapping)
+    return render(request, "composer/partials/csv_validation.html", {"workspace": workspace, **context})
 
 
-def _get_cached_workspace_feed_events(workspace, feeds, force_refresh=False):
-    """Return cached feed events and last refresh time for workspace feeds."""
-    cache_key = _feed_events_cache_key(workspace.id)
-    signature = tuple((str(feed.id), feed.url, feed.name, feed.website_url) for feed in feeds)
-    cached = cache.get(cache_key)
-    if cached and not force_refresh and cached.get("signature") == signature:
-        return cached.get("events", []), cached.get("fetched_at")
-
-    events = _fetch_feed_events_for_workspace(feeds)
-    fetched_at = timezone.now()
-    cache.set(
-        cache_key,
-        {
-            "signature": signature,
-            "events": events,
-            "fetched_at": fetched_at,
-        },
-        FEED_EVENTS_CACHE_TTL_SECONDS,
-    )
-    return events, fetched_at
+@login_required
+@require_permission("create_posts")
+@require_POST
+def csv_confirm_import(request, workspace_id):
+    """Kick off the CSV import."""
+    workspace = _get_workspace(request, workspace_id)
+    csv_data = request.session.get(f"csv_import_{workspace.id}")
+    mapping = request.session.get(f"csv_mapping_{workspace.id}")
+    if not csv_data or not mapping:
+        return HttpResponse("No CSV data found. Please upload again.", status=400)
+    result = csv_import.import_rows(workspace, request.user, csv_data["rows"], mapping)
+    request.session.pop(f"csv_import_{workspace.id}", None)
+    request.session.pop(f"csv_mapping_{workspace.id}", None)
+    return render(request, "composer/partials/csv_progress.html", {"workspace": workspace, **result})
 
 
-def _filter_events_for_feed(events, selected_feed_id):
-    if selected_feed_id == "all":
-        return events
-    return [event for event in events if event["feed_id"] == selected_feed_id]
-
-
-def _build_feed_events_context(workspace, selected_feed_id="all", offset=0):
-    feeds = list(Feed.objects.for_workspace(workspace.id))
-    selected_feed_id = _normalize_selected_feed_id(selected_feed_id, feeds)
-    selected_feed = next((feed for feed in feeds if str(feed.id) == selected_feed_id), None)
-    events, last_refreshed_at = _get_cached_workspace_feed_events(workspace, feeds)
-    filtered_events = _filter_events_for_feed(events, selected_feed_id)
-    page_events = filtered_events[offset : offset + FEED_EVENTS_PAGE_SIZE]
-    next_offset = offset + FEED_EVENTS_PAGE_SIZE
-    has_more = len(filtered_events) > next_offset
-    return {
-        "feeds": feeds,
-        "selected_feed_id": selected_feed_id,
-        "selected_feed": selected_feed,
-        "events": page_events,
-        "next_offset": next_offset,
-        "has_more": has_more,
-        "last_refreshed_at": last_refreshed_at,
-        "total_event_count": len(filtered_events),
-    }
+# ---------------------------------------------------------------------------
+# Feeds
+# ---------------------------------------------------------------------------
 
 
 def _render_feeds_tab(
-    request,
-    workspace,
-    *,
-    show_add_modal=False,
-    add_rss_url="",
-    add_error="",
-    selected_feed_id="all",
+    request, workspace, *, show_add_modal=False, add_rss_url="", add_error="", selected_feed_id="all"
 ):
-    """Render the feeds tab partial with modal state and first event page."""
-    context = _build_feed_events_context(workspace, selected_feed_id=selected_feed_id, offset=0)
+    context = feeds.events_context(workspace, selected_feed_id=selected_feed_id, offset=0)
     context.update(
-        {
-            "workspace": workspace,
-            "show_add_modal": show_add_modal,
-            "add_rss_url": add_rss_url,
-            "add_error": add_error,
-        }
+        {"workspace": workspace, "show_add_modal": show_add_modal, "add_rss_url": add_rss_url, "add_error": add_error}
     )
     return render(request, "composer/partials/feeds_tab.html", context)
 
 
-def _validate_rss_url(rss_url):
-    """Validate that a URL points to a reachable RSS/Atom XML feed."""
-    headers = {
-        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.1",
-        "User-Agent": "Osir AI RSS Validator/1.0",
-    }
-    response, _final_url = _safe_fetch_feed(rss_url, headers)
-    if response is None:
-        return False, "Could not reach this URL. Please check the link and try again.", {}
-
-    if response.status_code >= 400:
-        return False, "This URL could not be loaded as a feed.", {}
-
-    parsed_feed = _parse_feed_document(response.content)
-    if not parsed_feed:
-        return False, "This URL is reachable, but it does not appear to be a valid RSS/Atom feed.", {}
-
-    return (
-        True,
-        "",
-        {
-            "title": parsed_feed.get("title", "").strip(),
-            "website_url": parsed_feed.get("website_url", "").strip(),
-        },
+def _render_explore(request, workspace, category):
+    return render(
+        request, "composer/partials/feeds_explore.html", {"workspace": workspace, **feeds.explore(workspace, category)}
     )
 
 
@@ -3786,19 +2074,11 @@ def feed_list(request, workspace_id):
     """Return the feeds tab partial (empty state or feed list)."""
     workspace = _get_workspace(request, workspace_id)
     selected_feed_id = request.GET.get("feed_id", "all")
-    is_append = request.GET.get("append") == "1"
-    offset = _coerce_positive_int(request.GET.get("offset"), default=0)
-
-    if is_append:
-        context = _build_feed_events_context(workspace, selected_feed_id=selected_feed_id, offset=offset)
-        context.update(
-            {
-                "workspace": workspace,
-                "show_empty": False,
-            }
-        )
+    if request.GET.get("append") == "1":
+        offset = feeds.coerce_positive_int(request.GET.get("offset"), default=0)
+        context = feeds.events_context(workspace, selected_feed_id=selected_feed_id, offset=offset)
+        context.update({"workspace": workspace, "show_empty": False})
         return render(request, "composer/partials/feed_events_batch.html", context)
-
     return _render_feeds_tab(request, workspace, selected_feed_id=selected_feed_id)
 
 
@@ -3807,86 +2087,37 @@ def feed_list(request, workspace_id):
 @require_POST
 def feed_add(request, workspace_id):
     """Add a feed subscription to the workspace."""
-    from django.core.exceptions import ValidationError
-    from django.core.validators import URLValidator
-
     workspace = _get_workspace(request, workspace_id)
     rss_url = request.POST.get("rss_url", "").strip()
-    name = request.POST.get("name", "").strip()
-    website_url = request.POST.get("website_url", "").strip()
     source = request.POST.get("source", "")
     category = request.POST.get("category", "osir-favorites")
     selected_feed_id = request.POST.get("feed_id", "all")
-    derived_metadata = {}
-
-    if not rss_url:
-        if source == "explore":
-            return HttpResponse("Feed URL is required.", status=400)
-        return _render_feeds_tab(
-            request,
-            workspace,
-            show_add_modal=True,
-            add_rss_url=rss_url,
-            add_error="Feed URL is required.",
-            selected_feed_id=selected_feed_id,
-        )
-
-    validator = URLValidator()
     try:
-        validator(rss_url)
-    except ValidationError:
+        feeds.add_feed(
+            workspace,
+            request.user,
+            rss_url,
+            name=request.POST.get("name", "").strip(),
+            website_url=request.POST.get("website_url", "").strip(),
+            validate=source != "explore",
+        )
+    except ValueError as exc:
         if source == "explore":
-            return HttpResponse("Invalid URL.", status=400)
+            if str(exc) == "Already subscribed to this feed.":
+                return _render_explore(request, workspace, category)
+            return HttpResponse(str(exc), status=400)
         return _render_feeds_tab(
             request,
             workspace,
             show_add_modal=True,
             add_rss_url=rss_url,
-            add_error="Invalid URL.",
+            add_error=str(exc),
             selected_feed_id=selected_feed_id,
         )
-
-    if source != "explore":
-        is_valid_rss, validation_error, derived_metadata = _validate_rss_url(rss_url)
-        if not is_valid_rss:
-            return _render_feeds_tab(
-                request,
-                workspace,
-                show_add_modal=True,
-                add_rss_url=rss_url,
-                add_error=validation_error,
-                selected_feed_id=selected_feed_id,
-            )
-
-    if Feed.objects.for_workspace(workspace.id).filter(url=rss_url).exists():
-        # Already subscribed - if from explore, just re-render explore view
-        if source == "explore":
-            return _render_explore(request, workspace, category)
-        return _render_feeds_tab(
-            request,
-            workspace,
-            show_add_modal=True,
-            add_rss_url=rss_url,
-            add_error="Already subscribed to this feed.",
-            selected_feed_id=selected_feed_id,
-        )
-
-    resolved_name = name or derived_metadata.get("title") or rss_url
-    resolved_website_url = website_url or derived_metadata.get("website_url", "")
-    Feed.objects.create(
-        workspace=workspace,
-        name=resolved_name,
-        url=rss_url,
-        website_url=resolved_website_url,
-        added_by=request.user,
-    )
-    cache.delete(_feed_events_cache_key(workspace.id))
-
     if source == "explore":
         response = _render_explore(request, workspace, category)
         response["HX-Trigger"] = "feedsUpdated"
         return response
-
     return _render_feeds_tab(request, workspace, selected_feed_id=selected_feed_id)
 
 
@@ -3897,10 +2128,7 @@ def feed_delete(request, workspace_id, feed_id):
     """Remove a feed subscription."""
     workspace = _get_workspace(request, workspace_id)
     selected_feed_id = request.POST.get("feed_id", "all")
-    feed = get_object_or_404(Feed, id=feed_id, workspace=workspace)
-    feed.delete()
-    cache.delete(_feed_events_cache_key(workspace.id))
-
+    feeds.remove_feed(get_object_or_404(Feed, id=feed_id, workspace=workspace))
     return _render_feeds_tab(request, workspace, selected_feed_id=selected_feed_id)
 
 
@@ -3910,26 +2138,4 @@ def feed_delete(request, workspace_id, feed_id):
 def feed_explore(request, workspace_id):
     """Return the explore feeds modal content for a given category."""
     workspace = _get_workspace(request, workspace_id)
-    category = request.GET.get("category", "osir-favorites")
-    return _render_explore(request, workspace, category)
-
-
-def _render_explore(request, workspace, category):
-    """Shared helper to render the explore feeds partial."""
-    from .curated_feeds import get_feed_categories, get_feeds_for_category
-
-    subscribed_urls = set(Feed.objects.for_workspace(workspace.id).values_list("url", flat=True))
-    curated = get_feeds_for_category(category)
-    for feed in curated:
-        feed["subscribed"] = feed["rss"] in subscribed_urls
-
-    return render(
-        request,
-        "composer/partials/feeds_explore.html",
-        {
-            "workspace": workspace,
-            "categories": get_feed_categories(),
-            "active_category": category,
-            "curated_feeds": curated,
-        },
-    )
+    return _render_explore(request, workspace, request.GET.get("category", "osir-favorites"))
