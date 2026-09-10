@@ -65,7 +65,7 @@
     }
     .cal-day.past .day-num { color: #78716C; }
     .cal-day.today .day-num {
-        background: #F97316; color: white;
+        background: #0a0a0a; color: white;
     }
 
     .post-chip {
@@ -84,7 +84,7 @@
     .status-draft      { background: #F5F5F4; color: #57534E; border: 1px solid #E7E5E4; }
     .status-draft .chip-dot { background: #A8A29E; }
     .status-pending_review, .status-pending_client { background: #FFF7ED; color: #C2410C; border: 1px solid #FED7AA; }
-    .status-pending_review .chip-dot, .status-pending_client .chip-dot { background: #F97316; }
+    .status-pending_review .chip-dot, .status-pending_client .chip-dot { background: #0a0a0a; }
     .status-scheduled  { background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; }
     .status-scheduled .chip-dot { background: #3B82F6; }
     .status-published  { background: #F0FDF4; color: #15803D; border: 1px solid #BBF7D0; }
@@ -92,7 +92,7 @@
     .status-approved   { background: #F0FDFA; color: #0F766E; border: 1px solid #99F6E4; }
     .status-approved .chip-dot { background: #14B8A6; }
     .status-changes_requested { background: #FFF7ED; color: #C2410C; border: 1px solid #FED7AA; }
-    .status-changes_requested .chip-dot { background: #F97316; }
+    .status-changes_requested .chip-dot { background: #0a0a0a; }
     .status-rejected   { background: #FEF2F2; color: #B91C1C; border: 1px solid #FECACA; }
     .status-rejected .chip-dot { background: #EF4444; }
     .status-publishing { background: #EEF2FF; color: #4338CA; border: 1px solid #C7D2FE; }
@@ -126,7 +126,7 @@
         width: 14px; height: 14px; border-radius: 50%;
         display: flex; align-items: center; justify-content: center;
         background: transparent; border: none; cursor: pointer;
-        color: #EA580C; font-size: 10px;
+        color: #000000; font-size: 10px;
     }
     .filter-chip button:hover { background: #FFEDD5; }
 
@@ -142,7 +142,7 @@
         margin-bottom: -1px;
     }
     .publish-tab:hover { color: #1C1917; border-bottom-color: #D6D3D1; }
-    .publish-tab.active { color: #C2410C; border-bottom-color: #F97316; }
+    .publish-tab.active { color: #C2410C; border-bottom-color: #0a0a0a; }
 
     /* Hide scrollbar on filter containers */
     .cal-filters-scroll::-webkit-scrollbar { display: none; }
@@ -167,7 +167,7 @@
     .publish-filter-select:hover,
     .cal-filter-select:hover { border-color: #D6D3D1; }
     .publish-filter-select:focus,
-    .cal-filter-select:focus { outline: none; border-color: #F97316; box-shadow: 0 0 0 2px rgba(249,115,22,0.15); }
+    .cal-filter-select:focus { outline: none; border-color: #0a0a0a; box-shadow: 0 0 0 2px rgba(0,0,0,0.15); }
     .publish-filter-icon,
     .cal-filter-icon {
         position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
@@ -193,14 +193,14 @@
         display: none;
         position: absolute; top: 6px; right: 6px;
         width: 22px; height: 22px; border-radius: 50%;
-        background: #F97316; color: white; border: none;
+        background: #0a0a0a; color: white; border: none;
         align-items: center; justify-content: center;
         cursor: pointer; font-size: 14px; line-height: 1;
-        box-shadow: 0 2px 6px rgba(249,115,22,0.35);
+        box-shadow: 0 2px 6px rgba(0,0,0,0.35);
         transition: transform 100ms ease, background 100ms ease;
         z-index: 5;
     }
-    .cal-add-btn:hover { background: #EA580C; transform: scale(1.1); }
+    .cal-add-btn:hover { background: #000000; transform: scale(1.1); }
     .cal-add-cell { position: relative; }
     .cal-add-cell.has-posts:hover .cal-add-btn { display: flex; }
 
@@ -209,8 +209,8 @@
         top: 50%; left: 50%; right: auto;
         transform: translate(-50%, -50%);
         width: 32px; height: 32px;
-        background: #F97316; color: white;
-        box-shadow: 0 2px 6px rgba(249,115,22,0.35);
+        background: #0a0a0a; color: white;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.35);
         border: none;
     }
     .cal-add-cell:not(.has-posts) .cal-add-btn svg { width: 16px; height: 16px; }
@@ -218,9 +218,9 @@
         display: flex;
     }
     .cal-add-cell:not(.has-posts) .cal-add-btn:hover {
-        background: #EA580C;
+        background: #000000;
         transform: translate(-50%, -50%) scale(1.1);
-        box-shadow: 0 6px 20px rgba(249,115,22,0.35);
+        box-shadow: 0 6px 20px rgba(0,0,0,0.35);
     }
 
     /* Day/week grids (non-month cells): hide add button entirely when cell has posts */
@@ -308,7 +308,7 @@
        the cursor-following drag clone stays visible. */
     .chip-ghost { display: none !important; }
     /* Highlight the day cell currently under the drag (toggled in onMove). */
-    .cal-drop.cal-drop-active { background: #FFF7ED; box-shadow: inset 0 0 0 2px #F97316; }
+    .cal-drop.cal-drop-active { background: #FFF7ED; box-shadow: inset 0 0 0 2px #0a0a0a; }
     /* While dragging, suppress the per-cell "+" add buttons that would otherwise
        flicker under the cursor as it crosses cells. */
     body.cal-dragging .cal-add-btn { display: none !important; }
@@ -324,8 +324,8 @@
     .post-chip:hover .cal-select-box,
     .cal-select-box.is-checked,
     body.has-selection .cal-select-box { opacity: 1; }
-    .cal-select-box.is-checked { background: #F97316; border-color: #F97316; }
-    .cal-select-box:hover { border-color: #F97316; }
+    .cal-select-box.is-checked { background: #0a0a0a; border-color: #0a0a0a; }
+    .cal-select-box:hover { border-color: #0a0a0a; }
     /* In list rows the checkbox is always visible (there's room). */
     .row-select-box { opacity: 1; }
     /* The shared toast host and the selection bar both sit bottom-centre. Lift

@@ -1,9 +1,10 @@
+# One origin: Django keeps the paths it still owns, Next.js (web/) serves the rest.
+# Extend @django while Django pages are migrated to web/; shrink it as they move.
 {$APP_DOMAIN:localhost} {
-    reverse_proxy app:8000
     encode gzip
-}
 
-{$CONSOLE_DOMAIN:console.localhost} {
+    @django path /api/* /accounts/* /admin/* /static/* /media/* /social-accounts/* /oauth/* /webhooks/* /portal/* /health/* /.well-known/* /workspace/* /workspaces/* /organizations/* /members/* /settings/* /notifications/* /onboarding/*
+    reverse_proxy @django app:8000
+
     reverse_proxy console:3000
-    encode gzip
 }

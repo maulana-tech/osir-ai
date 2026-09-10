@@ -39,7 +39,7 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  # Osir Console (web/): the human side of the autopilot. Needs STUDIO_API_KEY in .env.
+  # The Next.js web UI (web/). Signs people in with the Django session; no API key needed.
   console:
     build: ./web
     ports:

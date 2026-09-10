@@ -17,7 +17,7 @@ from ninja import NinjaAPI
 from ninja.errors import AuthenticationError, HttpError
 from ninja.openapi.docs import Swagger
 
-from apps.api.auth import ApiKeyAuth, McpAuth
+from apps.api.auth import ApiKeyAuth, McpAuth, WebSessionAuth
 from apps.api.routers.accounts import router as accounts_router
 from apps.api.routers.analytics import router as analytics_router
 from apps.api.routers.me import router as me_router
@@ -63,7 +63,8 @@ api = NinjaAPI(
         "drafts from the workspace's drafts list in the web UI. Published "
         "posts are never deletable — they remain as audit records."
     ),
-    auth=ApiKeyAuth(),
+    # Bearer keys for agents and scripts; the Django session (+ CSRF) for the web UI.
+    auth=[ApiKeyAuth(), WebSessionAuth()],
     docs=NoncedSwagger(),
     # Trailing slashes are tolerated by the router but we use the
     # explicit-slash form everywhere internally for OpenAPI clarity.

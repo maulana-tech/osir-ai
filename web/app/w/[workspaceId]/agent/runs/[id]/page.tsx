@@ -1,14 +1,14 @@
 import { notFound } from "next/navigation";
-import { StudioError, studio } from "@/lib/studio";
-import { Section, StatusPill, timeAgo } from "../../components/ui";
+import { PageHeader, Section, StatusPill, timeAgo } from "@/app/components/ui";
+import { StudioError, api } from "@/lib/studio";
 
 export const dynamic = "force-dynamic";
 
-export default async function RunDetail({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params;
+export default async function RunDetail({ params }: { params: Promise<{ workspaceId: string; id: string }> }) {
+  const { workspaceId, id } = await params;
   let run;
   try {
-    run = await studio.run(id);
+    run = await api.run(workspaceId, id);
   } catch (e) {
     if (e instanceof StudioError && e.status === 404) notFound();
     throw e;
@@ -16,13 +16,12 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
   const report = run.report ?? {};
   return (
     <div className="space-y-6">
-      <Section title={`${run.task} run`} hint={timeAgo(run.created_at)}>
+      <PageHeader title={`${run.task} run`} />
+      <Section title="Summary" hint={timeAgo(run.created_at)}>
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <StatusPill status={run.status} />
           {run.dry_run && <span className="pill">dry run</span>}
-          {run.triggered_by && (
-            <span style={{ color: "var(--muted)" }}>asked by {run.triggered_by}</span>
-          )}
+          {run.triggered_by && <span style={{ color: "var(--muted)" }}>asked by {run.triggered_by}</span>}
         </div>
         {run.instruction && <p className="mt-3 whitespace-pre-wrap text-sm">“{run.instruction}”</p>}
         {run.error && (

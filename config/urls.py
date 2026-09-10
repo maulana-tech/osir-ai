@@ -6,6 +6,7 @@ from django.urls import include, path
 from apps.accounts.views import health_check
 from apps.api.api import api as agent_api
 from apps.oauth_server import views as oauth_views
+from apps.webapi.api import api as web_api
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -33,6 +34,8 @@ urlpatterns = [
     # is Ninja's (patterns, app_namespace, instance_namespace) tuple,
     # which Django's path() handles natively.
     path("api/v1/", agent_api.urls),
+    # JSON for the Next.js UI (web/): Django session + CSRF only.
+    path("api/web/", web_api.urls),
     # OAuth 2.1 Authorization Server for the MCP connector flow (native
     # Claude Desktop login). django-oauth-toolkit serves /oauth/authorize/
     # + /oauth/token/ + /oauth/revoke_token/; apps.oauth_server adds DCR

@@ -32,7 +32,7 @@ from typing import Any
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.http import HttpRequest
-from ninja.security import HttpBearer
+from ninja.security import APIKeyCookie, HttpBearer
 
 from apps.api.limits import is_failed_auth_ip_blocked, record_failed_auth
 from apps.api_keys.models import ApiKey
@@ -239,14 +239,14 @@ class OAuthMcpActor:
     rate_override_writes = None
     rate_override_reads = None
 
-    def __init__(self, *, user: Any, membership: Any) -> None:
+    def __init__(self, *, user: Any, membership: Any, kind: str = "oauth") -> None:
         self.issued_by = user
         self.issued_by_id = user.id
         self.workspace = membership.workspace
         self.workspace_id = membership.workspace_id
         # Namespaced id so the per-actor rate-limit cache key
         # (``apikey:<id>:w``) can't collide with a real ApiKey UUID.
-        self.id = f"oauth:{user.id}"
+        self.id = f"{kind}:{user.id}"
         self.social_accounts = _AllWorkspaceAccounts(membership.workspace_id)
         # Read by ``McpAuth`` to build the request's ``VirtualMembership`` — the
         # single source of truth for this caller's permissions.
@@ -363,4 +363,54 @@ class McpAuth(ApiKeyAuth):
         # Lets audit logging / author attribution treat the OAuth user as the
         # actor, exactly as the key path treats ``api_key.issued_by``.
         request.user = actor.issued_by  # type: ignore[assignment]
+        return actor
+
+
+# ---------------------------------------------------------------------------
+# Browser session auth (the Next.js UI in web/)
+# ---------------------------------------------------------------------------
+#
+# A logged-in person using the web UI is the third caller type. They carry
+# Django's session cookie, so this is cookie auth with the CSRF check Ninja
+# performs for ``APIKeyCookie(csrf=True)``. Like OAuth, a person acts as
+# themselves: every account in the chosen workspace, their own permissions.
+# The workspace is picked with an ``X-Workspace-Id`` header (must be one of
+# their memberships) and falls back to the dashboard's notion of "current".
+
+WORKSPACE_HEADER = "X-Workspace-Id"
+
+
+def _membership_for(user: Any, workspace_id: str | None):
+    from apps.members.models import WorkspaceMembership
+
+    if not workspace_id:
+        return _resolve_active_membership(user)
+    return (
+        WorkspaceMembership.objects.select_related("workspace", "custom_role")
+        .filter(user=user, workspace_id=workspace_id, workspace__is_archived=False)
+        .first()
+    )
+
+
+class WebSessionAuth(APIKeyCookie):
+    """Django session + CSRF for the browser UI; yields the same actor shape as OAuth."""
+
+    param_name: str = settings.SESSION_COOKIE_NAME
+
+    def authenticate(self, request: HttpRequest, key: str | None):  # type: ignore[override]
+        user = getattr(request, "user", None)
+        if user is None or not user.is_authenticated:
+            return None
+        membership = _membership_for(user, request.headers.get(WORKSPACE_HEADER))
+        if membership is None:
+            LOG.info("Session auth rejected: user %s has no usable workspace membership.", user.id)
+            return None
+        actor = OAuthMcpActor(user=user, membership=membership, kind="session")
+        request.api_key = actor  # type: ignore[attr-defined]
+        request.workspace = actor.workspace  # type: ignore[attr-defined]
+        request.workspace_membership = VirtualMembership(  # type: ignore[attr-defined]
+            effective_permissions=actor.effective_permissions,
+            workspace=actor.workspace,
+            user=user,
+        )
         return actor

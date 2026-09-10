@@ -70,8 +70,57 @@ export interface Post {
   first_comment: string;
   status: string;
   scheduled_at: string | null;
+  published_at: string | null;
   proposed_publish_at: string | null;
   platform_posts: PlatformPostSummary[];
   created_at: string;
   updated_at: string;
+}
+
+// --- app shell ---------------------------------------------------------------
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  role: string;
+  timezone: string;
+  agent_autonomy: Autonomy;
+  approval_workflow_mode: string;
+  permissions: string[];
+}
+
+export interface Me {
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    avatar_url: string;
+    tos_accepted: boolean;
+    totp_enabled: boolean;
+  };
+  organization: { id: string; name: string; role: string; can_create_workspace: boolean } | null;
+  current_workspace_id: string | null;
+  workspaces: WorkspaceSummary[];
+}
+
+export interface Channel {
+  id: string;
+  platform: string;
+  platform_label: string;
+  name: string;
+  handle: string;
+  avatar_url: string;
+  connection_status: string;
+  last_error: string;
+  queued_post_count: number;
+  auth_source: string;
+}
+
+export interface Sidebar {
+  channels: Channel[];
+  unhealthy_channels: Channel[];
+  connectable_platforms: { platform: string; label: string }[];
+  analytics_enabled_platforms: string[];
+  unread_inbox_count: number;
+  pending_approvals: number;
 }

@@ -286,6 +286,35 @@ def create(request, payload: CreatePostRequest):
     return status_code, body
 
 
+@router.get("/", summary="List posts, newest first")
+def list_posts(request, status: str | None = None, limit: int = 50, cursor: str | None = None):
+    """REST twin of the MCP ``list_posts`` tool: same allowlist rule, same paging."""
+    from django.db.models import Exists, OuterRef
+
+    from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
+    from apps.composer.models import PlatformPost
+    from apps.mcp.handlers import _visible_posts_qs
+
+    enforce_http_rate_limits(request, is_write=False)
+    limit = max(1, min(limit, 100))
+    try:
+        offset = decode_offset_cursor(cursor)
+    except ValueError as exc:
+        raise HttpError(400, "cursor is not a valid pagination cursor") from exc
+    qs = _visible_posts_qs(request.api_key).prefetch_related("platform_posts__social_account")
+    if status:
+        qs = qs.filter(Exists(PlatformPost.objects.filter(post_id=OuterRef("pk"), status=status)))
+    rows = list(qs.order_by("-created_at", "id")[offset : offset + limit + 1])
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    log_audit_entry(request, action="posts.list", target_id=None, status_code=200)
+    return {
+        "posts": [_post_to_response(request, p).model_dump(mode="json") for p in rows],
+        "limit": limit,
+        "next_cursor": encode_offset_cursor(offset + limit) if has_more else None,
+    }
+
+
 @router.get("/{post_id}", response=PostResponse, summary="Read a single post")
 def retrieve(request, post_id: uuid.UUID):
     enforce_http_rate_limits(request, is_write=False)

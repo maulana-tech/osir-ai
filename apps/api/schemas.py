@@ -100,7 +100,7 @@ class StorageSummary(Schema):
 class MeResponse(Schema):
     """Echoes everything the key is scoped to so an agent can self-introspect."""
 
-    api_key_id: uuid.UUID
+    api_key_id: str = Field(description="ApiKey UUID, or session:<user id> / oauth:<user id> for people.")
     workspace_id: uuid.UUID
     workspace_name: str
     organization_id: uuid.UUID

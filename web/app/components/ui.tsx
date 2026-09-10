@@ -39,14 +39,11 @@ export function Section({ title, hint, children }: { title: string; hint?: strin
   );
 }
 
-export function RunRow({ run }: { run: AgentRun }) {
+export function RunRow({ run, base }: { run: AgentRun; base: string }) {
   const actions = run.report?.actions?.length ?? 0;
   const decisions = run.report?.decisions_for_humans?.length ?? 0;
   return (
-    <Link
-      href={`/runs/${run.id}`}
-      className="flex items-center justify-between gap-4 rounded-lg px-3 py-2 hover:bg-neutral-50"
-    >
+    <Link href={`${base}/runs/${run.id}`} className="flex items-center justify-between gap-4 rounded-lg px-3 py-2 hover:bg-neutral-50">
       <div className="min-w-0">
         <div className="flex items-center gap-2 text-sm">
           <span className="font-semibold capitalize">{run.task}</span>
@@ -74,5 +71,14 @@ export function Empty({ children }: { children: React.ReactNode }) {
     <p className="py-6 text-center text-sm" style={{ color: "var(--muted)" }}>
       {children}
     </p>
+  );
+}
+
+export function PageHeader({ title, children }: { title: string; children?: React.ReactNode }) {
+  return (
+    <div className="mb-6 flex items-baseline justify-between">
+      <h1 className="text-xl font-bold">{title}</h1>
+      {children}
+    </div>
   );
 }

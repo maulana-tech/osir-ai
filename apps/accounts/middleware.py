@@ -25,6 +25,7 @@ EXEMPT_PATH_PREFIXES = (
     "/health/",
     "/static/",
     "/admin/",
+    "/api/",
 )
 
 

@@ -34,8 +34,8 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  # In production the console talks to Studio through Caddy over HTTPS: the
-  # Agent API rejects bearer tokens on plain HTTP once DEBUG is off.
+  # The web UI's server-side fetches go back in through Caddy (same origin the
+  # browser uses), so cookies, CSRF and X-Forwarded-Proto all line up.
   console:
     ports: []
     environment:
@@ -55,7 +55,6 @@ services:
       - "443:443"
     environment:
       - APP_DOMAIN=${APP_DOMAIN:-localhost}
-      - CONSOLE_DOMAIN=${CONSOLE_DOMAIN:-console.localhost}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data

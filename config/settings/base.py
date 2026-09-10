@@ -72,6 +72,7 @@ LOCAL_APPS = [
     "apps.oauth_server",
     "apps.analytics",
     "apps.autopilot",
+    "apps.webapi",
     "theme",
 ]
 

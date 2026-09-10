@@ -30,7 +30,7 @@ def me(request):
     )
 
     body = MeResponse(
-        api_key_id=api_key.id,
+        api_key_id=str(api_key.id),
         workspace_id=workspace.id,
         workspace_name=workspace.name,
         organization_id=workspace.organization_id,

@@ -15,6 +15,7 @@ import uuid
 from typing import Any
 
 from django.http import HttpRequest
+from ninja.errors import HttpError
 
 from apps.api.models import IdempotencyRecord
 from apps.api_keys.models import ApiKey, ApiKeyAuditLog
@@ -159,6 +160,10 @@ def claim_idempotency_slot(
     Raises ``ValueError`` when the key was reused with a different body
     (caller turns this into 422).
     """
+    if idempotency_key and not isinstance(api_key, ApiKey):
+        # Session / OAuth actors have no ApiKey row to hang a record on.
+        raise HttpError(400, "Idempotency keys are only supported with API-key authentication")
+
     from django.db import IntegrityError, transaction
 
     if not idempotency_key:

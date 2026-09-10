@@ -9,9 +9,11 @@ ALLOWED_HOSTS = ["*"]
 # request Origin / Referer host to be explicitly trusted for any POST coming
 # through a non-localhost hostname, even with DEBUG=True.
 # Comma-separated, e.g. "https://foo.ngrok-free.app,https://bar".
+# The Next.js dev server (web/) proxies to Django from http://localhost:3000.
+CSRF_TRUSTED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 _extra = _os.environ.get("CSRF_TRUSTED_ORIGINS", "").strip()
 if _extra:
-    CSRF_TRUSTED_ORIGINS = [o.strip() for o in _extra.split(",") if o.strip()]
+    CSRF_TRUSTED_ORIGINS += [o.strip() for o in _extra.split(",") if o.strip()]
 
 # Tunnel-aware redirect handling. ngrok terminates TLS and forwards plain
 # HTTP to runserver; without this Django treats requests as http:// and
