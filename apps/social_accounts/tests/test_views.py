@@ -58,17 +58,22 @@ class TestOAuthState:
 
 
 @pytest.mark.django_db
-class TestAccountListView:
-    def test_requires_authentication(self, client, workspace):
-        url = reverse("social_accounts:list", kwargs={"workspace_id": workspace.id})
-        response = client.get(url)
+class TestChannelsApi:
+    """The channels page is the Next.js console reading ``GET /api/web/workspaces/<id>/channels``."""
+
+    def _url(self, workspace):
+        return f"/api/web/workspaces/{workspace.id}/channels"
+
+    def test_page_url_redirects_to_console(self, client, workspace):
+        response = client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
         assert response.status_code == 302
-        assert "/accounts/" in response.url
+        assert response.url == f"/w/{workspace.id}/channels"
+
+    def test_requires_authentication(self, client, workspace):
+        assert client.get(self._url(workspace)).status_code == 401
 
     def test_returns_200_for_authenticated_user(self, authenticated_client, workspace):
-        url = reverse("social_accounts:list", kwargs={"workspace_id": workspace.id})
-        response = authenticated_client.get(url)
-        assert response.status_code == 200
+        assert authenticated_client.get(self._url(workspace)).status_code == 200
 
     def test_shows_connected_accounts(self, authenticated_client, workspace):
         SocialAccount.objects.create(
@@ -77,14 +82,11 @@ class TestAccountListView:
             account_platform_id="123",
             account_name="My Facebook Page",
         )
-        url = reverse("social_accounts:list", kwargs={"workspace_id": workspace.id})
-        response = authenticated_client.get(url)
-        assert b"My Facebook Page" in response.content
+        accounts = authenticated_client.get(self._url(workspace)).json()["accounts"]
+        assert [a["name"] for a in accounts] == ["My Facebook Page"]
 
     def test_shows_empty_state(self, authenticated_client, workspace):
-        url = reverse("social_accounts:list", kwargs={"workspace_id": workspace.id})
-        response = authenticated_client.get(url)
-        assert b"No accounts connected yet" in response.content
+        assert authenticated_client.get(self._url(workspace)).json()["accounts"] == []
 
 
 @pytest.mark.django_db
@@ -539,12 +541,12 @@ class TestRetryWebhooksView:
         """
         self._account(workspace, connection_status=SocialAccount.ConnectionStatus.ERROR)
 
-        response = authenticated_client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
+        response = authenticated_client.get(f"/api/web/workspaces/{workspace.id}/channels")
 
-        body = response.content.decode()
-        assert "Real-time comments are off" not in body
-        assert "Try again" not in body
-        assert "Reconnect" in body
+        (account,) = response.json()["accounts"]
+        # The console hides "Try again" and offers Reconnect on ``needs_reconnect``.
+        assert account["needs_reconnect"] is True
+        assert account["webhooks_active"] is False
 
     def test_the_stale_card_is_answered_with_the_reconnect_state(self, authenticated_client, workspace):
         """A card rendered while healthy can still POST after the account breaks.
