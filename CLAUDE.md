@@ -94,8 +94,11 @@ pytest --cov=apps --cov-report=term-missing              # coverage (what CI run
 - `osir_agent/loops.py:run_task(task, instruction=)` runs one of `inbox` / `calendar` / `digest` / `command`; prompts and the escalation guardrails are in `osir_agent/prompts.py`; `osir_agent/studio.py:select_tools` hides `WRITE_TOOLS` in dry-run. `main.py` is the AgentCore entrypoint, `run_local.py` the CLI, `schedule/create_schedules.sh` the EventBridge Scheduler setup.
 - Tests: `cd agent && pytest` (no network). Root `ruff check .` also covers `agent/`.
 
-### Osir Console (`web/`)
-- Next.js 15 App Router + TypeScript + Tailwind 4. Server components read from Studio through `lib/studio.ts` (server-only, one API key from `STUDIO_URL` / `STUDIO_API_KEY`); mutations are server actions in `app/actions.ts`. No client-side data fetching; `AutoRefresh` re-renders every 15s.
+### Web UI (`web/`)
+- Next.js 15 App Router + TypeScript + Tailwind 4, the strangler replacement for the Django templates. One origin: `next.config.ts` rewrites `DJANGO_PATHS` (api, accounts, social-accounts, workspace, …) to `STUDIO_URL` in dev; `Caddyfile` does the same split in prod. Shrink both lists as pages move.
+- Auth is the Django session: `apps/api/auth.py:WebSessionAuth` (session cookie + CSRF) on `/api/web/` (`apps/webapi`, session-only, routers per area, `common.scoped()` resolves the workspace membership) and alongside API keys on `/api/v1/`. Server components fetch through `lib/studio.ts` (forwards cookies, adds CSRF/Origin on unsafe methods; `X-Workspace-Id` for `/api/v1/`); browser mutations use `lib/client.ts` `call()` inside the `useAction` hook, which surfaces the error and `router.refresh()`es. Flows that must stay a browser navigation (OAuth connect, sign out) post a `DjangoForm`.
+- Routes: `/w/[workspaceId]/{calendar,inbox,analytics,approvals,agent,channels,settings}`, `/org/{settings,workspaces,members,api-keys}`, `/me/{account,notifications}`; `app/components/Shell.tsx` is the frame (sidebar + onboarding checklist). Still Django: composer, media library, login/signup/2FA, OAuth connect, client portal, onboarding tokens.
+- Business logic the web API needs lives in `apps/<app>/services.py` (shared with the Django views), never duplicated in routers. Tests: `apps/webapi/tests/` (`member_client` fixture = logged-in org owner with CSRF enforced).
 - Commands: `cd web && npm run dev`, `npm run build`, `npm run typecheck`. Needs a running Studio.
 
 ## Docs

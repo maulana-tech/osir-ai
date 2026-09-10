@@ -3,7 +3,7 @@
 {$APP_DOMAIN:localhost} {
     encode gzip
 
-    @django path /api/* /accounts/* /admin/* /static/* /media/* /social-accounts/* /oauth/* /webhooks/* /portal/* /health/* /.well-known/* /workspace/* /workspaces/* /organizations/* /members/* /settings/* /notifications/* /onboarding/*
+    @django path /api/* /accounts/* /admin/* /static/* /media/* /social-accounts/* /oauth/* /webhooks/* /portal/* /health/* /.well-known/* /workspace/* /onboarding/*
     reverse_proxy @django app:8000
 
     reverse_proxy console:3000

@@ -8,6 +8,6 @@ export default async function Home() {
   const me = await api.me();
   if (!me.user.tos_accepted) redirect("/accounts/accept-terms/");
   const target = me.current_workspace_id ?? me.workspaces[0]?.id;
-  if (!target) redirect("/workspaces/");
+  if (!target) redirect("/org/workspaces");
   redirect(`/w/${target}/calendar`);
 }

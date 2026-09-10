@@ -36,15 +36,4 @@ export async function markHandled(formData: FormData) {
   refresh(workspaceId);
 }
 
-export async function approvePost(formData: FormData) {
-  const workspaceId = ws(formData);
-  await api.approve(workspaceId, String(formData.get("id")), String(formData.get("comment") ?? ""));
-  refresh(workspaceId);
-}
 
-export async function rejectPost(formData: FormData) {
-  const workspaceId = ws(formData);
-  const comment = String(formData.get("comment") ?? "").trim() || "Rejected from the console";
-  await api.reject(workspaceId, String(formData.get("id")), comment);
-  refresh(workspaceId);
-}

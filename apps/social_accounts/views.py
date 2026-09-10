@@ -31,7 +31,6 @@ from .provider_factory import _get_provider_for_platform
 from .webhooks import (
     subscribe_account_webhooks,
     subscribe_account_webhooks_task,
-    unsubscribe_account_webhooks,
 )
 
 logger = logging.getLogger(__name__)
@@ -944,43 +943,9 @@ def disconnect(request, workspace_id, account_id):
     """Disconnect a social account."""
     account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
 
-    # Stop the platform pushing us this account's activity before we drop the
-    # token that would let us unsubscribe.
-    if account.oauth_access_token:
-        unsubscribe_account_webhooks(account)
+    from . import services as account_services
 
-    if account.composio_connected_account_id:
-        composio.delete_connection(account.composio_connected_account_id)
-
-    # Try to revoke token
-    try:
-        provider = _get_provider_for_platform(account.platform, request.org.id)
-        if account.oauth_access_token:
-            provider.revoke_token(account.oauth_access_token)
-    except Exception:
-        logger.warning(
-            "Failed to revoke token for %s, proceeding with disconnect",
-            account,
-        )
-
-    # Delete posts that ONLY target this account (will be fully orphaned).
-    # Multi-platform posts keep their other PlatformPost targets via cascade.
-    from django.db.models import Count
-
-    from apps.composer.models import PlatformPost, Post
-
-    orphan_post_ids = list(
-        PlatformPost.objects.filter(social_account=account)
-        .values("post_id")
-        .annotate(total_platforms=Count("post__platform_posts"))
-        .filter(total_platforms=1)
-        .values_list("post_id", flat=True)
-    )
-    if orphan_post_ids:
-        Post.objects.filter(id__in=orphan_post_ids).delete()
-
-    account_name = account.account_name or account.account_handle
-    account.delete()
+    account_name = account_services.disconnect_account(account, request.org.id)
 
     messages.success(request, f"Disconnected {account_name}.")
 

@@ -110,17 +110,20 @@ starts are instant. Watch progress with `docker compose logs -f tailwind`.
 
 Open http://localhost:8000 - you're running.
 
-The Compose file also starts the **Osir Console** on http://localhost:3000. It needs
-`STUDIO_API_KEY` in `.env` (issue one from Organization → API Keys after creating your
-account, then `docker compose up -d console`). To run the agent's command worker in Docker
-too, add your AWS credentials to `.env` and start the `agent` profile:
+The Compose file also starts the **web UI** (`web/`, Next.js) on http://localhost:3000.
+Sign in there: it proxies `/accounts/`, `/api/`, OAuth and the remaining Django pages to
+Studio, so the browser sees one origin and one session. To run the agent's command worker
+in Docker too, add `STUDIO_API_KEY` and your AWS credentials to `.env` and start the
+`agent` profile:
 
 ```bash
 docker compose --profile agent up -d
 ```
 
-In production (`make docker-prod`), Caddy serves Studio on `APP_DOMAIN` and the console on
-`CONSOLE_DOMAIN`; set both in `.env` and include `app` plus your domain in `ALLOWED_HOSTS`.
+In production (`make docker-prod`), Caddy serves everything on `APP_DOMAIN`: Django paths
+(`/api/`, `/accounts/`, `/social-accounts/`, `/workspace/` …, see `Caddyfile`) go to the
+`app` container and everything else to the Next.js `console` container. Include `app` plus
+your domain in `ALLOWED_HOSTS`.
 
 
 ## Fully Local Development (without Docker)
@@ -683,12 +686,12 @@ STUDIO_URL=http://localhost:8000 STUDIO_API_KEY=bb_studio_... python run_local.p
 
 Deployment to Amazon Bedrock AgentCore Runtime with EventBridge Scheduler triggers is documented in [agent/README.md](agent/README.md), together with the architecture diagram.
 
-### Osir Console (`web/`)
+### Web UI (`web/`)
 
-A Next.js app for the human side: what the agent did, what it needs you to decide, a box to ask it for something, the autonomy dial, and approve/reject for the drafts it submitted. It talks to Studio's `/api/v1/agent/*` routes with one server-side API key. See [web/README.md](web/README.md).
+The Next.js/TypeScript frontend. It is the app: calendar, inbox, analytics, approvals, channels, workspace / organization / team / API-key settings, account and notifications, plus the autopilot console (what the agent did, what it needs you to decide, a command box, the autonomy dial). It signs you in with the Django session and reads Studio through `/api/web/` (session-authenticated) and `/api/v1/agent/*`. The composer, media library and the public pages (login, signup, OAuth connect, client portal) are still Django templates, proxied under the same origin while they migrate. See [web/README.md](web/README.md).
 
 ```bash
-cd web && cp .env.example .env.local && npm install && npm run dev   # http://localhost:3000
+cd web && cp .env.example .env.local && npm install && npm run dev   # http://localhost:3000 (needs Studio on :8000)
 python agent/run_local.py worker                                     # executes commands typed in the console
 ```
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from django.test import Client
 
-from apps.members.models import WorkspaceMembership
+from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.workspaces.models import Workspace
 
 
@@ -21,6 +21,8 @@ def second_workspace(db, organization):
 
 @pytest.fixture
 def member_client(db, org_owner, workspace, second_workspace):
+    # The user signal auto-provisions a personal organization; the API is v1 "one org per user".
+    OrgMembership.objects.filter(user=org_owner).exclude(organization=workspace.organization).delete()
     for ws in (workspace, second_workspace):
         WorkspaceMembership.objects.create(
             user=org_owner, workspace=ws, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER

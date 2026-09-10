@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Me, Sidebar as SidebarData, WorkspaceSummary } from "@/lib/types";
+import { DjangoForm } from "./DjangoForm";
 import { NavLink } from "./NavLink";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
@@ -28,9 +29,21 @@ function Badge({ n }: { n: number }) {
   );
 }
 
+function Group({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="mb-1 px-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
+        {title}
+      </div>
+      <div className="space-y-0.5">{children}</div>
+    </div>
+  );
+}
+
 export function Sidebar({ me, workspace, sidebar }: { me: Me; workspace: WorkspaceSummary; sidebar: SidebarData }) {
   const base = `/w/${workspace.id}`;
   const can = (p: string) => workspace.permissions.includes(p);
+  const orgAdmin = me.organization?.role === "owner" || me.organization?.role === "admin";
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r" style={{ borderColor: "var(--line)", background: "#fafafa" }}>
       <div className="px-4 pt-5 pb-3">
@@ -51,28 +64,26 @@ export function Sidebar({ me, workspace, sidebar }: { me: Me; workspace: Workspa
               Social Inbox <Badge n={sidebar.unread_inbox_count} />
             </NavLink>
           )}
-          {can("view_analytics") && sidebar.analytics_enabled_platforms.length > 0 && (
-            <NavLink href={`${base}/analytics`}>Analytics</NavLink>
-          )}
+          {can("view_analytics") && sidebar.analytics_enabled_platforms.length > 0 && <NavLink href={`${base}/analytics`}>Analytics</NavLink>}
           <NavLink href={`${base}/approvals`}>
             Approvals <Badge n={sidebar.pending_approvals} />
           </NavLink>
           <NavLink href={`${base}/agent`}>Autopilot</NavLink>
-          <NavLink href="/notifications/" external>
-            Notifications
-          </NavLink>
+          <NavLink href="/me/notifications">Notifications</NavLink>
         </div>
 
         <div>
           <div className="mb-1 flex items-center justify-between px-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
-            <span>Channels</span>
+            <Link href={`${base}/channels`} className="hover:text-black">
+              Channels
+            </Link>
             {can("manage_social_accounts") && (
-              <a href={`/social-accounts/${workspace.id}/connect/`} className="hover:text-black" title="Connect a channel">
+              <Link href={`${base}/channels`} className="hover:text-black" title="Connect a channel">
                 +
-              </a>
+              </Link>
             )}
           </div>
-          {sidebar.channels.length === 0 && (
+          {sidebar.channels.length === 0 && sidebar.unhealthy_channels.length === 0 && (
             <p className="px-2 text-xs" style={{ color: "var(--muted)" }}>
               No channels yet.
             </p>
@@ -103,41 +114,30 @@ export function Sidebar({ me, workspace, sidebar }: { me: Me; workspace: Workspa
           </ul>
         </div>
 
-        {(me.organization?.role === "owner" || me.organization?.role === "admin" || can("manage_workspace_settings")) && (
-          <div>
-            <div className="mb-1 px-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
-              Settings
-            </div>
-            <div className="space-y-0.5">
-              {can("manage_workspace_settings") && (
-                <NavLink href={`/workspaces/${workspace.id}/settings/`} external>
-                  Workspace
-                </NavLink>
-              )}
-              {me.organization && (
-                <NavLink href="/organizations/settings/" external>
-                  Organization
-                </NavLink>
-              )}
-              <NavLink href="/members/" external>
-                Team
-              </NavLink>
-            </div>
-          </div>
-        )}
+        <Group title="Settings">
+          {can("manage_workspace_settings") && <NavLink href={`${base}/settings`}>Workspace</NavLink>}
+          {me.organization && (
+            <>
+              {orgAdmin && <NavLink href="/org/settings">Organization</NavLink>}
+              <NavLink href="/org/workspaces">Workspaces</NavLink>
+              <NavLink href="/org/members">Team</NavLink>
+              {(orgAdmin || can("manage_api_keys")) && <NavLink href="/org/api-keys">API keys</NavLink>}
+            </>
+          )}
+        </Group>
       </nav>
 
       <div className="border-t px-4 py-3 text-xs" style={{ borderColor: "var(--line)" }}>
         <div className="truncate font-semibold">{me.user.name}</div>
         <div className="flex items-center justify-between" style={{ color: "var(--muted)" }}>
-          <a href="/accounts/settings/" className="hover:text-black">
+          <Link href="/me/account" className="hover:text-black">
             Account
-          </a>
-          <form method="post" action="/accounts/logout/">
+          </Link>
+          <DjangoForm action="/accounts/logout/">
             <button type="submit" className="hover:text-black">
               Sign out
             </button>
-          </form>
+          </DjangoForm>
         </div>
       </div>
     </aside>

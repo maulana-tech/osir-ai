@@ -20,7 +20,7 @@ export function WorkspaceSwitcher({
       aria-label="Workspace"
       onChange={(e) => {
         const v = e.target.value;
-        if (v === "__new__") window.location.href = "/workspaces/";
+        if (v === "__new__") window.location.href = "/org/workspaces";
         else router.push(`/w/${v}/calendar`);
       }}
     >

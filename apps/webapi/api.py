@@ -13,8 +13,13 @@ from ninja import NinjaAPI
 
 from apps.api.auth import WebSessionAuth
 
+from .routers.account import router as account_router
+from .routers.admin import org_router
+from .routers.admin import router as admin_router
 from .routers.analytics import router as analytics_router
+from .routers.approvals import router as approvals_router
 from .routers.calendar import router as calendar_router
+from .routers.channels import router as channels_router
 from .routers.inbox import router as inbox_router
 from .routers.me import router as me_router
 from .routers.workspaces import router as workspaces_router
@@ -32,3 +37,8 @@ api.add_router("/workspaces", workspaces_router)
 api.add_router("/workspaces", calendar_router)
 api.add_router("/workspaces", inbox_router)
 api.add_router("/workspaces", analytics_router)
+api.add_router("/workspaces", channels_router)
+api.add_router("/workspaces", admin_router)
+api.add_router("/workspaces", approvals_router)
+api.add_router("/org", org_router)
+api.add_router("/me", account_router)

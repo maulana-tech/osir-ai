@@ -142,14 +142,9 @@ def _handle_org_deletion(request, org):
     if request.org_membership.org_role != OrgMembership.OrgRole.OWNER:
         raise PermissionDenied
 
-    from apps.organizations.tasks import execute_scheduled_org_deletion
+    from . import services
 
-    grace = timedelta(days=14)
-    org.deletion_requested_at = django_tz.now()
-    org.deletion_scheduled_for = django_tz.now() + grace
-    org.save(update_fields=["deletion_requested_at", "deletion_scheduled_for"])
-
-    execute_scheduled_org_deletion(str(org.id), schedule=grace)
+    services.schedule_deletion(org)
 
     messages.success(request, "Organization scheduled for deletion in 14 days.")
     return redirect("organizations:settings")

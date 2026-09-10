@@ -115,16 +115,4 @@ export const api = {
   markRead: (workspaceId: string, id: string) =>
     studio<Decision>(`/api/v1/agent/decisions/${id}/read`, { method: "POST", workspaceId }),
   approvals: (workspaceId: string) => studio<Post[]>("/api/v1/agent/approvals", { workspaceId }),
-  approve: (workspaceId: string, id: string, comment = "") =>
-    studio<Post>(`/api/v1/agent/approvals/${id}/approve`, {
-      method: "POST",
-      body: JSON.stringify({ comment }),
-      workspaceId,
-    }),
-  reject: (workspaceId: string, id: string, comment: string) =>
-    studio<Post>(`/api/v1/agent/approvals/${id}/reject`, {
-      method: "POST",
-      body: JSON.stringify({ comment }),
-      workspaceId,
-    }),
 };
