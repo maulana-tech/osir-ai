@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Osir AI: a Django 5 social-media management app (multi-platform publishing, scheduling, inbox, analytics, client portal) with a REST + MCP "Agent API", plus `agent/`, a Strands Agents SDK autopilot (AWS "Agents for Humans" hackathon entry) that drives Studio through that MCP server and runs on Amazon Bedrock AgentCore. Server-rendered templates + HTMX + Alpine.js; Tailwind 4 is the only frontend build step. Background jobs run on django-background-tasks (PostgreSQL-backed, no Redis/Celery).
+Osir AI: a Django 5 social-media management app (multi-platform publishing, scheduling, inbox, analytics, client portal) with a REST + MCP "Agent API", plus `agent/`, a Strands Agents SDK autopilot (AWS "Agents for Humans" hackathon entry) that drives Studio through that MCP server and runs on Amazon Bedrock AgentCore. The product UI is the Next.js console in `web/` (TypeScript, Tailwind 4) talking to Django over `/api/web/`; Django only still renders auth, OAuth-connect, client-portal and onboarding-token pages (Tailwind in `theme/` builds their CSS). Background jobs run on django-background-tasks (PostgreSQL-backed, no Redis/Celery).
 
 ## Commands
 
-Python 3.12 (CI + pyproject). Node 20+ for Tailwind only. `make help` lists everything.
+Python 3.12 (CI + pyproject). Node 20+ for the console (`web/`) and Tailwind. `make help` lists everything.
 
 ```bash
 make setup                      # cp .env.example .env, pip install, npm install (theme/static_src), migrate
@@ -23,7 +23,7 @@ make migrate / make migrations
 
 make docker-up                  # postgres, migrate, app, worker, tailwind, console (web/)
 docker compose --profile agent up -d   # + agent-worker (needs STUDIO_API_KEY and AWS creds in .env)
-make docker-prod                # adds Caddy: APP_DOMAIN → app, CONSOLE_DOMAIN → console
+make docker-prod                # adds Caddy on APP_DOMAIN: Django paths → app, everything else → console
 
 make lint                       # ruff check . && ruff format --check .
 make format                     # ruff check --fix . && ruff format .
@@ -79,18 +79,17 @@ pytest --cov=apps --cov-report=term-missing              # coverage (what CI run
 - `apps/api` is a django-ninja API at `/api/v1/` (routers in `apps/api/routers/`, OpenAPI at `/api/v1/docs`). `apps/api/auth.py:ApiKeyAuth` resolves `Authorization: Bearer bb_studio_...` to an `ApiKey` (`apps/api_keys`) and duck-types `request.workspace_membership` so the same `require_permission` decorators work in Ninja routes. Key permissions are intersected with the issuer's live workspace permissions on every request.
 - `apps/mcp` is a JSON-RPC 2.0 Streamable-HTTP MCP server mounted at `/api/v1/mcp`, sharing the API's auth, rate limits (`apps/api/limits.py`) and audit log. Registry in `apps/mcp/tools.py`; post/media/analytics tools in `apps/mcp/handlers.py`; inbox, ideas, schedule, approval and `notify_team` tools in `apps/mcp/handlers_autopilot.py` (both imported from `apps/mcp/apps.py`). New tools: define a handler `(args, context) -> dict`, re-check the workspace permission with `_require_perm`, scope reads by the key's `social_accounts` allowlist, and register with `register_tool`. The OAuth path substitutes a shim for `api_key`, so only use `.workspace_id`, `.social_accounts.all()`, `.issued_by`.
 - `apps/autopilot` records agent runs (`AgentRun`) and serves the console: REST at `/api/v1/agent/*` (`apps/autopilot/api.py`: runs, command, decisions, policy, approvals) and runner MCP tools `record_run` / `claim_pending_run` / `finish_run` (`apps/autopilot/mcp_tools.py`). A console command is a `pending` run; `tasks.invoke_agentcore` hands it to AgentCore when `AGENT_RUNTIME_ARN` is set, otherwise `agent/run_local.py worker` claims it.
-- Inbox replies go through `apps/inbox/services.py:send_reply` (shared by the HTMX view and the MCP tool). Agent-facing notification event types are `EventType.AGENT_DECISION_NEEDED` and `AGENT_DIGEST`.
+- Inbox replies go through `apps/inbox/services.py:send_reply` (shared by the web API and the MCP tool). Agent-facing notification event types are `EventType.AGENT_DECISION_NEEDED` and `AGENT_DIGEST`.
 - `apps/oauth_server` is an OAuth 2.1 authorization server (django-oauth-toolkit + dynamic client registration) so native MCP connectors like Claude Desktop can log in without an API key. Discovery docs are wired in `config/urls.py`.
 
 ### Cross-cutting helpers (`apps/common`)
 - `encryption.py`: `EncryptedTextField` / `EncryptedJSONField` (AES-GCM, key derived from `SECRET_KEY` + `ENCRYPTION_KEY_SALT`). Use these for any token/secret column.
-- `htmx.py`: `trigger_response` / `toast_response` for HTMX-driven views.
 - `validators.py`: SSRF-safe URL checks, tag normalization, safe XML parsing.
-- `context_processors.py:sidebar_context` builds the nav; heavy per-request logic belongs there only if it's needed on every page.
+- `console.py:console(path)` turns a retired Django page URL into a redirect to the console page while keeping the URL name for `reverse()`.
 
 ### Autopilot agent (`agent/`)
 - Separate Python package with its own venv and `requirements.txt` (strands-agents, mcp, bedrock-agentcore). It has no Studio imports: it discovers tools from `/api/v1/mcp/` at runtime with a `bb_studio_` key.
-- `Workspace.agent_autonomy` (`off` / `draft_only` / `autopilot`, edited on the approvals settings page) is the human's dial; the agent reads it through the `get_workspace_policy` MCP tool and `osir_agent/studio.py:select_tools` drops `SCHEDULE_TOOLS` unless autopilot, direct scheduling, and `publish_directly` all hold.
+- `Workspace.agent_autonomy` (`off` / `draft_only` / `autopilot`, edited on the console's workspace settings page) is the human's dial; the agent reads it through the `get_workspace_policy` MCP tool and `osir_agent/studio.py:select_tools` drops `SCHEDULE_TOOLS` unless autopilot, direct scheduling, and `publish_directly` all hold.
 - `osir_agent/loops.py:run_task(task, instruction=)` runs one of `inbox` / `calendar` / `digest` / `command`; prompts and the escalation guardrails are in `osir_agent/prompts.py`; `osir_agent/studio.py:select_tools` hides `WRITE_TOOLS` in dry-run. `main.py` is the AgentCore entrypoint, `run_local.py` the CLI, `schedule/create_schedules.sh` the EventBridge Scheduler setup.
 - Tests: `cd agent && pytest` (no network). Root `ruff check .` also covers `agent/`.
 
