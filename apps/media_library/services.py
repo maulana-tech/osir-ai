@@ -806,3 +806,160 @@ def _to_uuid(val):
         return uuid.UUID(str(val))
     except (ValueError, AttributeError):
         return None
+
+
+# ──────────────────────────────────────────────────────────────
+#  Shared by the Django views and the web API
+# ──────────────────────────────────────────────────────────────
+
+SORT_OPTIONS = {
+    "name": "filename",
+    "-name": "-filename",
+    "date": "created_at",
+    "-date": "-created_at",
+    "size": "file_size",
+    "-size": "-file_size",
+}
+
+
+def filter_assets(qs, params):
+    """Apply the library's type / folder / starred / uploader / search / sort query params."""
+    from .models import MediaAsset
+
+    file_type = params.get("type")
+    if file_type and file_type in dict(MediaAsset.MediaType.choices):
+        qs = qs.filter(media_type=file_type)
+    if params.get("folder"):
+        qs = qs.filter(folder_id=params["folder"])
+    if params.get("starred") == "1":
+        qs = qs.filter(is_starred=True)
+    if params.get("uploader"):
+        qs = qs.filter(uploaded_by_id=params["uploader"])
+    query = (params.get("q") or "").strip()
+    if query:
+        qs = MediaAsset.objects.search(query, queryset=qs)
+    return qs.order_by(SORT_OPTIONS.get(params.get("sort") or "-date", "-created_at"))
+
+
+def parse_edit_operations(data) -> dict:
+    """Validate crop / rotate / flip / resize params (form or JSON). Raises ValueError."""
+
+    def present(key):
+        v = data.get(key)
+        return v is not None and v != ""
+
+    operations: dict = {}
+    if present("crop_x"):
+        try:
+            crop = {k: int(data[f"crop_{k}"]) for k in ("x", "y", "width", "height")}
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError("Invalid crop parameters") from exc
+        if crop["x"] < 0 or crop["y"] < 0 or crop["width"] <= 0 or crop["height"] <= 0:
+            raise ValueError("Invalid crop parameters")
+        operations["crop"] = crop
+    if present("rotate"):
+        try:
+            rotate = int(data["rotate"])
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid rotate parameter") from exc
+        if rotate not in (0, 90, 180, 270):
+            raise ValueError("Invalid rotate parameter")
+        if rotate:
+            operations["rotate"] = rotate
+    if present("flip"):
+        if data["flip"] not in ("horizontal", "vertical"):
+            raise ValueError("Invalid flip parameter")
+        operations["flip"] = data["flip"]
+    if present("resize_width") and present("resize_height"):
+        try:
+            rw, rh = int(data["resize_width"]), int(data["resize_height"])
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid resize parameters") from exc
+        if rw <= 0 or rh <= 0 or rw > 10000 or rh > 10000:
+            raise ValueError("Invalid resize parameters")
+        operations["resize"] = {"width": rw, "height": rh}
+    return operations
+
+
+def describe_operations(operations: dict) -> str:
+    parts = []
+    if "crop" in operations:
+        parts.append(f"Cropped to {operations['crop']['width']}x{operations['crop']['height']}")
+    if "rotate" in operations:
+        parts.append(f"Rotated {operations['rotate']}deg")
+    if "flip" in operations:
+        parts.append(f"Flipped {operations['flip']}")
+    if "resize" in operations:
+        parts.append(f"Resized to {operations['resize']['width']}x{operations['resize']['height']}")
+    return ", ".join(parts)
+
+
+def submit_edit(asset, data, user):
+    """Create a version for an image edit or a video trim and queue the processing task.
+
+    ``data`` is the form / JSON payload. Returns the new version, or None when
+    the payload contained nothing to do. Raises ValueError on bad input.
+    """
+    from .models import MediaAsset
+    from .tasks import process_image_edit, process_video_trim
+
+    if asset.media_type in (MediaAsset.MediaType.IMAGE, MediaAsset.MediaType.GIF):
+        operations = parse_edit_operations(data)
+        if not operations:
+            return None
+        version = create_version(asset, asset.file, describe_operations(operations), user)
+        process_image_edit(str(version.id), operations)
+        return version
+    if asset.media_type == MediaAsset.MediaType.VIDEO:
+        start, end = data.get("trim_start"), data.get("trim_end")
+        if start is None or end is None or start == "" or end == "":
+            return None
+        try:
+            start_s, end_s = float(start), float(end)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid trim parameters") from exc
+        if start_s < 0 or end_s <= start_s:
+            raise ValueError("Trim end must be after trim start")
+        version = create_version(asset, asset.file, f"Trimmed to {start_s:.1f}s - {end_s:.1f}s", user)
+        process_video_trim(str(version.id), start_s, end_s)
+        return version
+    return None
+
+
+def rename_folder(folder, name: str):
+    from .models import MediaFolder
+
+    name = name.strip()
+    if not name:
+        raise ValueError("Folder name is required")
+    duplicate = (
+        MediaFolder.objects.filter(workspace=folder.workspace, parent_folder=folder.parent_folder, name=name)
+        .exclude(pk=folder.pk)
+        .exists()
+    )
+    if duplicate:
+        raise ValueError(f"A folder named '{name}' already exists in this location.")
+    folder.name = name
+    folder.save(update_fields=["name", "updated_at"])
+    return folder
+
+
+def delete_folder(folder):
+    """Delete a folder, lifting its assets and subfolders to the parent (or root)."""
+    from .models import MediaAsset, MediaFolder
+
+    MediaAsset.objects.filter(folder=folder).update(folder=folder.parent_folder)
+    MediaFolder.objects.filter(parent_folder=folder).update(parent_folder=folder.parent_folder)
+    folder.delete()
+
+
+def tag_suggestions(qs, query: str, limit: int = 20) -> list[str]:
+    query = (query or "").strip().lower()
+    if not query:
+        return []
+    found: set[str] = set()
+    for tag_list in qs.exclude(tags=[]).values_list("tags", flat=True)[:500]:
+        for tag in tag_list:
+            if query in tag.lower():
+                found.add(tag)
+    return sorted(found)[:limit]

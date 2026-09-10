@@ -18,11 +18,15 @@ from .services import (
     ProtectedAssetError,
     create_asset,
     create_folder,
-    create_version,
     delete_asset,
+    delete_folder,
+    filter_assets,
+    rename_folder,
     restore_version,
+    submit_edit,
+    tag_suggestions,
 )
-from .tasks import process_image_edit, process_media_asset, process_video_trim
+from .tasks import process_media_asset
 from .validators import get_accepted_file_types
 
 
@@ -48,41 +52,12 @@ def library_index(request, workspace_id):
         organization_id=workspace.organization_id,
     ).select_related("uploaded_by", "folder")
 
-    # Filters
     file_type = request.GET.get("type")
-    if file_type and file_type in dict(MediaAsset.MediaType.choices):
-        qs = qs.filter(media_type=file_type)
-
     folder_id = request.GET.get("folder")
-    if folder_id:
-        qs = qs.filter(folder_id=folder_id)
-    elif request.GET.get("folder") is None and not request.GET.get("q"):
-        pass  # Show all
-
     starred = request.GET.get("starred")
-    if starred == "1":
-        qs = qs.filter(is_starred=True)
-
-    uploader = request.GET.get("uploader")
-    if uploader:
-        qs = qs.filter(uploaded_by_id=uploader)
-
-    # Search
     query = request.GET.get("q", "").strip()
-    if query:
-        qs = MediaAsset.objects.search(query, queryset=qs)
-
-    # Sort
-    sort = request.GET.get("sort", "-created_at")
-    sort_options = {
-        "name": "filename",
-        "-name": "-filename",
-        "date": "created_at",
-        "-date": "-created_at",
-        "size": "file_size",
-        "-size": "-file_size",
-    }
-    qs = qs.order_by(sort_options.get(sort, "-created_at"))
+    sort = request.GET.get("sort", "-date")
+    qs = filter_assets(qs, request.GET)
 
     # Pagination
     paginator = Paginator(qs, 48)
@@ -266,85 +241,10 @@ def asset_edit(request, workspace_id, asset_id):
         raise Http404
 
     if request.method == "POST":
-        if asset.media_type in (MediaAsset.MediaType.IMAGE, MediaAsset.MediaType.GIF):
-            operations = {}
-            # Parse and validate crop data
-            if request.POST.get("crop_x") is not None and request.POST.get("crop_x") != "":
-                try:
-                    crop_x = int(request.POST["crop_x"])
-                    crop_y = int(request.POST["crop_y"])
-                    crop_w = int(request.POST["crop_width"])
-                    crop_h = int(request.POST["crop_height"])
-                    if crop_x < 0 or crop_y < 0 or crop_w <= 0 or crop_h <= 0:
-                        raise ValueError("Crop dimensions must be positive")
-                    operations["crop"] = {
-                        "x": crop_x,
-                        "y": crop_y,
-                        "width": crop_w,
-                        "height": crop_h,
-                    }
-                except (ValueError, TypeError):
-                    return JsonResponse({"error": "Invalid crop parameters"}, status=400)
-            if request.POST.get("rotate"):
-                try:
-                    rotate_val = int(request.POST["rotate"])
-                    if rotate_val not in (0, 90, 180, 270):
-                        raise ValueError("Rotate must be 0, 90, 180, or 270")
-                    operations["rotate"] = rotate_val
-                except (ValueError, TypeError):
-                    return JsonResponse({"error": "Invalid rotate parameter"}, status=400)
-            if request.POST.get("flip"):
-                flip_val = request.POST["flip"]
-                if flip_val not in ("horizontal", "vertical"):
-                    return JsonResponse({"error": "Invalid flip parameter"}, status=400)
-                operations["flip"] = flip_val
-            if request.POST.get("resize_width") and request.POST.get("resize_height"):
-                try:
-                    rw = int(request.POST["resize_width"])
-                    rh = int(request.POST["resize_height"])
-                    if rw <= 0 or rh <= 0 or rw > 10000 or rh > 10000:
-                        raise ValueError("Resize dimensions out of range")
-                    operations["resize"] = {"width": rw, "height": rh}
-                except (ValueError, TypeError):
-                    return JsonResponse({"error": "Invalid resize parameters"}, status=400)
-
-            if operations:
-                # Build change description
-                parts = []
-                if "crop" in operations:
-                    parts.append(f"Cropped to {operations['crop']['width']}x{operations['crop']['height']}")
-                if "rotate" in operations:
-                    parts.append(f"Rotated {operations['rotate']}deg")
-                if "flip" in operations:
-                    parts.append(f"Flipped {operations['flip']}")
-                if "resize" in operations:
-                    parts.append(f"Resized to {operations['resize']['width']}x{operations['resize']['height']}")
-                description = ", ".join(parts)
-
-                version = create_version(
-                    asset=asset,
-                    file=asset.file,
-                    change_description=description,
-                    created_by=request.user,
-                )
-                process_image_edit(str(version.id), operations)
-
-        elif asset.media_type == MediaAsset.MediaType.VIDEO:
-            start = request.POST.get("trim_start")
-            end = request.POST.get("trim_end")
-            if start is not None and end is not None:
-                start_seconds = float(start)
-                end_seconds = float(end)
-                description = f"Trimmed to {start_seconds:.1f}s - {end_seconds:.1f}s"
-
-                version = create_version(
-                    asset=asset,
-                    file=asset.file,
-                    change_description=description,
-                    created_by=request.user,
-                )
-                process_video_trim(str(version.id), start_seconds, end_seconds)
-
+        try:
+            submit_edit(asset, request.POST, request.user)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
         return redirect("media_library:asset_detail", workspace_id=workspace.id, asset_id=asset.id)
 
     context = {
@@ -567,28 +467,10 @@ def folder_rename(request, workspace_id, folder_id):
     workspace = _get_workspace_or_404(request, workspace_id)
     folder = get_object_or_404(MediaFolder, pk=folder_id, workspace=workspace)
 
-    name = request.POST.get("name", "").strip()
-    if not name:
-        return JsonResponse({"error": "Folder name is required"}, status=400)
-
-    # Check for duplicate sibling name before saving
-    duplicate = (
-        MediaFolder.objects.filter(
-            workspace=workspace,
-            parent_folder=folder.parent_folder,
-            name=name,
-        )
-        .exclude(pk=folder.pk)
-        .exists()
-    )
-    if duplicate:
-        return JsonResponse(
-            {"error": f"A folder named '{name}' already exists in this location."},
-            status=400,
-        )
-
-    folder.name = name
-    folder.save(update_fields=["name", "updated_at"])
+    try:
+        rename_folder(folder, request.POST.get("name", ""))
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
 
     if request.htmx:
         folders = MediaFolder.objects.filter(
@@ -613,13 +495,7 @@ def folder_delete(request, workspace_id, folder_id):
     workspace = _get_workspace_or_404(request, workspace_id)
     folder = get_object_or_404(MediaFolder, pk=folder_id, workspace=workspace)
 
-    # Move assets to parent folder (or root)
-    MediaAsset.objects.filter(folder=folder).update(folder=folder.parent_folder)
-
-    # Move subfolders to parent
-    MediaFolder.objects.filter(parent_folder=folder).update(parent_folder=folder.parent_folder)
-
-    folder.delete()
+    delete_folder(folder)
 
     if request.htmx:
         folders = MediaFolder.objects.filter(
@@ -646,28 +522,11 @@ def folder_delete(request, workspace_id, folder_id):
 @require_GET
 def tag_autocomplete(request, workspace_id):
     workspace = _get_workspace_or_404(request, workspace_id)
-    query = request.GET.get("q", "").strip().lower()
-
-    if not query or len(query) < 1:
-        return JsonResponse([], safe=False)
-
-    # Collect distinct tags from workspace assets
-    assets = (
-        MediaAsset.objects.for_workspace_with_shared(
-            workspace_id=workspace.id,
-            organization_id=workspace.organization_id,
-        )
-        .exclude(tags=[])
-        .values_list("tags", flat=True)
+    qs = MediaAsset.objects.for_workspace_with_shared(
+        workspace_id=workspace.id,
+        organization_id=workspace.organization_id,
     )
-
-    all_tags = set()
-    for tag_list in assets[:500]:
-        for tag in tag_list:
-            if query in tag.lower():
-                all_tags.add(tag)
-
-    return JsonResponse(sorted(all_tags)[:20], safe=False)
+    return JsonResponse(tag_suggestions(qs, request.GET.get("q", "")), safe=False)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -775,28 +634,10 @@ def shared_library_index(request):
     if not org:
         raise Http404
 
-    qs = MediaAsset.objects.shared_only(org.id)
-
-    # Search
     query = request.GET.get("q", "").strip()
-    if query:
-        qs = MediaAsset.objects.search(query, queryset=qs)
-
-    # Filter by type
     file_type = request.GET.get("type")
-    if file_type and file_type in dict(MediaAsset.MediaType.choices):
-        qs = qs.filter(media_type=file_type)
-
-    sort = request.GET.get("sort", "-created_at")
-    sort_options = {
-        "name": "filename",
-        "-name": "-filename",
-        "date": "created_at",
-        "-date": "-created_at",
-        "size": "file_size",
-        "-size": "-file_size",
-    }
-    qs = qs.order_by(sort_options.get(sort, "-created_at"))
+    sort = request.GET.get("sort", "-date")
+    qs = filter_assets(MediaAsset.objects.shared_only(org.id), request.GET)
 
     paginator = Paginator(qs, 48)
     page = paginator.get_page(request.GET.get("page", 1))
@@ -925,83 +766,10 @@ def shared_asset_edit(request, asset_id):
     asset = get_object_or_404(MediaAsset.objects.shared_only(org.id), pk=asset_id)
 
     if request.method == "POST":
-        if asset.media_type in (MediaAsset.MediaType.IMAGE, MediaAsset.MediaType.GIF):
-            operations = {}
-            if request.POST.get("crop_x") is not None and request.POST.get("crop_x") != "":
-                try:
-                    crop_x = int(request.POST["crop_x"])
-                    crop_y = int(request.POST["crop_y"])
-                    crop_w = int(request.POST["crop_width"])
-                    crop_h = int(request.POST["crop_height"])
-                    if crop_x < 0 or crop_y < 0 or crop_w <= 0 or crop_h <= 0:
-                        raise ValueError("Crop dimensions must be positive")
-                    operations["crop"] = {
-                        "x": crop_x,
-                        "y": crop_y,
-                        "width": crop_w,
-                        "height": crop_h,
-                    }
-                except (ValueError, TypeError):
-                    return JsonResponse({"error": "Invalid crop parameters"}, status=400)
-            if request.POST.get("rotate"):
-                try:
-                    rotate_val = int(request.POST["rotate"])
-                    if rotate_val not in (0, 90, 180, 270):
-                        raise ValueError("Rotate must be 0, 90, 180, or 270")
-                    operations["rotate"] = rotate_val
-                except (ValueError, TypeError):
-                    return JsonResponse({"error": "Invalid rotate parameter"}, status=400)
-            if request.POST.get("flip"):
-                flip_val = request.POST["flip"]
-                if flip_val not in ("horizontal", "vertical"):
-                    return JsonResponse({"error": "Invalid flip parameter"}, status=400)
-                operations["flip"] = flip_val
-            if request.POST.get("resize_width") and request.POST.get("resize_height"):
-                try:
-                    rw = int(request.POST["resize_width"])
-                    rh = int(request.POST["resize_height"])
-                    if rw <= 0 or rh <= 0 or rw > 10000 or rh > 10000:
-                        raise ValueError("Resize dimensions out of range")
-                    operations["resize"] = {"width": rw, "height": rh}
-                except (ValueError, TypeError):
-                    return JsonResponse({"error": "Invalid resize parameters"}, status=400)
-
-            if operations:
-                parts = []
-                if "crop" in operations:
-                    parts.append(f"Cropped to {operations['crop']['width']}x{operations['crop']['height']}")
-                if "rotate" in operations:
-                    parts.append(f"Rotated {operations['rotate']}deg")
-                if "flip" in operations:
-                    parts.append(f"Flipped {operations['flip']}")
-                if "resize" in operations:
-                    parts.append(f"Resized to {operations['resize']['width']}x{operations['resize']['height']}")
-                description = ", ".join(parts)
-
-                version = create_version(
-                    asset=asset,
-                    file=asset.file,
-                    change_description=description,
-                    created_by=request.user,
-                )
-                process_image_edit(str(version.id), operations)
-
-        elif asset.media_type == MediaAsset.MediaType.VIDEO:
-            start = request.POST.get("trim_start")
-            end = request.POST.get("trim_end")
-            if start is not None and end is not None:
-                start_seconds = float(start)
-                end_seconds = float(end)
-                description = f"Trimmed to {start_seconds:.1f}s - {end_seconds:.1f}s"
-
-                version = create_version(
-                    asset=asset,
-                    file=asset.file,
-                    change_description=description,
-                    created_by=request.user,
-                )
-                process_video_trim(str(version.id), start_seconds, end_seconds)
-
+        try:
+            submit_edit(asset, request.POST, request.user)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
         return redirect("media_library_org:shared_asset_detail", asset_id=asset.id)
 
     context = {
@@ -1130,14 +898,4 @@ def shared_tag_autocomplete(request):
     org = request.org
     if not org:
         raise Http404
-    query = request.GET.get("q", "").strip().lower()
-    if not query or len(query) < 1:
-        return JsonResponse([], safe=False)
-
-    assets = MediaAsset.objects.shared_only(org.id).exclude(tags=[]).values_list("tags", flat=True)
-    all_tags = set()
-    for tag_list in assets[:500]:
-        for tag in tag_list:
-            if query in tag.lower():
-                all_tags.add(tag)
-    return JsonResponse(sorted(all_tags)[:20], safe=False)
+    return JsonResponse(tag_suggestions(MediaAsset.objects.shared_only(org.id), request.GET.get("q", "")), safe=False)

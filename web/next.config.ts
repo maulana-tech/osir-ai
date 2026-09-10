@@ -15,6 +15,9 @@ const DJANGO_PATHS = [
   "oauth",
   "webhooks",
   "portal",
+  "workspace",
+  "organizations/media",
+  "onboarding",
   "health",
   ".well-known",
 ];
