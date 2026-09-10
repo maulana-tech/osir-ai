@@ -505,3 +505,53 @@ def repair_future_published_scheduled_at(*, workspace_id=None, apply=True):
         "queue_entry_count": queue_entry_count,
         "applied": bool(apply and rows),
     }
+
+
+# ---------------------------------------------------------------------------
+# Reschedule (calendar drag-and-drop)
+# ---------------------------------------------------------------------------
+
+# Dropping one of these onto the calendar is an implicit (re)schedule / retry.
+IMPLICIT_SCHEDULE_STATUSES = ("draft", "failed")
+
+
+class RescheduleDeniedError(PermissionError):
+    pass
+
+
+def reschedule_platform_post(pp, new_dt, *, user, perms):
+    """Move one PlatformPost to ``new_dt`` (aware datetime), enforcing the calendar's rules.
+
+    Raises ``ValueError`` for a chip that cannot move in its current status and
+    ``RescheduleDeniedError`` when the caller lacks the right. Drafts and failed
+    chips are promoted to ``scheduled`` (which needs ``publish_directly``);
+    every other status keeps its editorial state and only changes time.
+    """
+    from apps.composer.services import sync_post_scheduled_at
+
+    from .models import QueueEntry
+
+    post = pp.post
+    if not pp.is_reschedulable:
+        raise ValueError("Post cannot be rescheduled in its current status.")
+    is_own_post = post.author_id == user.id
+    if not (is_own_post or perms.get("edit_others_posts", False)):
+        raise RescheduleDeniedError("Permission denied.")
+    if pp.status in IMPLICIT_SCHEDULE_STATUSES and not perms.get("publish_directly", False):
+        raise RescheduleDeniedError("You do not have permission to schedule this post.")
+
+    pp.scheduled_at = new_dt
+    fields = ["status", "scheduled_at", "updated_at"]
+    if pp.status == "failed":
+        # Retrying: don't carry the previous attempt's failure state into the new one.
+        pp.publish_error = ""
+        pp.retry_count = 0
+        pp.next_retry_at = None
+        fields += ["publish_error", "retry_count", "next_retry_at"]
+    if pp.status in IMPLICIT_SCHEDULE_STATUSES and pp.can_transition_to("scheduled"):
+        pp.transition_to("scheduled")
+    pp.save(update_fields=fields)
+    # Keep any queue entry's slot mirror in step with the manual reschedule.
+    QueueEntry.objects.filter(post=post, queue__social_account=pp.social_account).update(assigned_slot_datetime=new_dt)
+    sync_post_scheduled_at(post)
+    return pp

@@ -96,3 +96,71 @@ def send_reply(message: InboxMessage, body: str, author) -> InboxReply:
         message.save(update_fields=["status"])
 
     return reply
+
+
+def reply_failure_reason(exc: Exception) -> str:
+    """A short, actionable reason for the user.
+
+    The platform's own error text carries internal diagnostics (trace IDs, raw
+    API JSON) that mean nothing to a workspace member, so it stays in the log
+    and the UI gets a stable sentence instead.
+    """
+    from providers.exceptions import OAuthError, RateLimitError, TokenExpiredError
+
+    if isinstance(exc, RateLimitError):
+        return "the account has hit its rate limit. Wait a few minutes and try again."
+    if isinstance(exc, TokenExpiredError | OAuthError):
+        return "the connection has expired. Reconnect the account in Workspace Settings."
+    return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
+
+
+def assign_message(message: InboxMessage, assignee_id, *, actor) -> InboxMessage:
+    """Assign (or unassign with ``None``) and notify the assignee. Raises ValueError for non-members."""
+    from apps.members.models import WorkspaceMembership
+    from apps.notifications.engine import notify
+    from apps.notifications.models import EventType
+
+    if assignee_id:
+        membership = (
+            WorkspaceMembership.objects.filter(workspace_id=message.workspace_id, user_id=assignee_id)
+            .select_related("user")
+            .first()
+        )
+        if not membership:
+            raise ValueError("User is not a workspace member.")
+        message.assigned_to = membership.user
+    else:
+        message.assigned_to = None
+    message.save(update_fields=["assigned_to"])
+
+    if message.assigned_to and message.assigned_to != actor:
+        notify(
+            user=message.assigned_to,
+            event_type=EventType.NEW_INBOX_MESSAGE,
+            title=f"You were assigned a {message.get_message_type_display()}",
+            body=f"From {message.sender_name}: {message.body[:100]}",
+            data={"message_id": str(message.id), "workspace_id": str(message.workspace_id)},
+        )
+    return message
+
+
+BULK_ACTIONS = ("mark_read", "resolve", "archive", "assign")
+
+
+def bulk_action(workspace_id, message_ids, action: str, value: str = "") -> int:
+    """Apply one bulk action to the given messages of a workspace; returns rows touched."""
+    from apps.members.models import WorkspaceMembership
+
+    qs = InboxMessage.objects.filter(id__in=message_ids, workspace_id=workspace_id)
+    if action == "mark_read":
+        return qs.filter(status=InboxMessage.Status.UNREAD).update(status=InboxMessage.Status.OPEN)
+    if action == "resolve":
+        return qs.exclude(status=InboxMessage.Status.ARCHIVED).update(status=InboxMessage.Status.RESOLVED)
+    if action == "archive":
+        return qs.update(status=InboxMessage.Status.ARCHIVED)
+    if action == "assign" and value:
+        membership = WorkspaceMembership.objects.filter(workspace_id=workspace_id, user_id=value).first()
+        if membership:
+            return qs.update(assigned_to=membership.user)
+        return 0
+    raise ValueError(f"Unknown bulk action: {action}")

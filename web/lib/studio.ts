@@ -2,6 +2,8 @@ import "server-only";
 import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import type { AgentRun, Decision, Me, Policy, Post, Sidebar } from "./types";
+import type { CalendarData } from "./types.calendar";
+import type { InboxDetail, InboxFeed } from "./types.inbox";
 
 const BASE = (process.env.STUDIO_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
@@ -75,6 +77,19 @@ export const api = {
   selectWorkspace: (workspaceId: string) =>
     studio("/api/web/me/workspace", { method: "POST", body: JSON.stringify({ workspace_id: workspaceId }) }),
   sidebar: (workspaceId: string) => studio<Sidebar>(`/api/web/workspaces/${workspaceId}/sidebar`),
+
+  calendar: (workspaceId: string, q: { start: string; end: string; tz?: string; channel?: string[]; status?: string[] }) => {
+    const params = new URLSearchParams({ start: q.start, end: q.end });
+    if (q.tz) params.set("tz", q.tz);
+    for (const c of q.channel ?? []) params.append("channel", c);
+    for (const s of q.status ?? []) params.append("status", s);
+    return studio<CalendarData>(`/api/web/workspaces/${workspaceId}/calendar?${params}`);
+  },
+
+  inbox: (workspaceId: string, query: URLSearchParams) =>
+    studio<InboxFeed>(`/api/web/workspaces/${workspaceId}/inbox?${query}`),
+  inboxMessage: (workspaceId: string, id: string) =>
+    studio<InboxDetail>(`/api/web/workspaces/${workspaceId}/inbox/${id}`),
 
   posts: (workspaceId: string, status?: string, limit = 50) =>
     studio<{ posts: Post[] }>(`/api/v1/posts/?limit=${limit}${status ? `&status=${status}` : ""}`, { workspaceId }).then(

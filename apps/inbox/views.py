@@ -11,8 +11,6 @@ from django.views.decorators.http import require_POST
 
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
-from apps.notifications.engine import notify
-from apps.notifications.models import EventType
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
@@ -206,20 +204,7 @@ def message_detail(request, workspace_id, message_id):
 # --- Reply ---
 
 
-def _reply_failure_reason(exc: Exception) -> str:
-    """A short, actionable reason for the user.
-
-    The platform's own error text carries internal diagnostics (trace IDs, raw
-    API JSON) that mean nothing to a workspace member, so it stays in the log
-    and the UI gets a stable sentence instead.
-    """
-    from providers.exceptions import OAuthError, RateLimitError, TokenExpiredError
-
-    if isinstance(exc, RateLimitError):
-        return "the account has hit its rate limit. Wait a few minutes and try again."
-    if isinstance(exc, TokenExpiredError | OAuthError):
-        return "the connection has expired. Reconnect the account in Workspace Settings."
-    return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
+_reply_failure_reason = services.reply_failure_reason
 
 
 @login_required
@@ -299,35 +284,10 @@ def assign_message(request, workspace_id, message_id):
     form = AssignForm(request.POST)
     if not form.is_valid():
         return HttpResponse("Invalid assignment.", status=400)
-
-    assigned_to_id = form.cleaned_data.get("assigned_to")
-    if assigned_to_id:
-        # Verify the user is a workspace member
-        membership = (
-            WorkspaceMembership.objects.filter(workspace=workspace, user_id=assigned_to_id)
-            .select_related("user")
-            .first()
-        )
-        if not membership:
-            return HttpResponse("User is not a workspace member.", status=400)
-        message.assigned_to = membership.user
-    else:
-        message.assigned_to = None
-
-    message.save(update_fields=["assigned_to"])
-
-    # Notify the assignee
-    if message.assigned_to and message.assigned_to != request.user:
-        notify(
-            user=message.assigned_to,
-            event_type=EventType.NEW_INBOX_MESSAGE,
-            title=f"You were assigned a {message.get_message_type_display()}",
-            body=f"From {message.sender_name}: {message.body[:100]}",
-            data={
-                "message_id": str(message.id),
-                "workspace_id": str(workspace.id),
-            },
-        )
+    try:
+        services.assign_message(message, form.cleaned_data.get("assigned_to"), actor=request.user)
+    except ValueError as exc:
+        return HttpResponse(str(exc), status=400)
 
     context = _detail_context(workspace, message)
     return render(request, "inbox/partials/_message_panel.html", context)
@@ -396,18 +356,7 @@ def bulk_action(request, workspace_id):
     action = form.cleaned_data["action"]
     value = form.cleaned_data.get("value", "")
 
-    qs = InboxMessage.objects.filter(id__in=message_ids, workspace=workspace)
-
-    if action == "mark_read":
-        qs.filter(status=InboxMessage.Status.UNREAD).update(status=InboxMessage.Status.OPEN)
-    elif action == "resolve":
-        qs.exclude(status=InboxMessage.Status.ARCHIVED).update(status=InboxMessage.Status.RESOLVED)
-    elif action == "archive":
-        qs.update(status=InboxMessage.Status.ARCHIVED)
-    elif action == "assign" and value:
-        membership = WorkspaceMembership.objects.filter(workspace=workspace, user_id=value).first()
-        if membership:
-            qs.update(assigned_to=membership.user)
+    services.bulk_action(workspace.id, message_ids, action, value)
 
     # Re-fetch and return updated list
     messages = InboxMessage.objects.for_workspace(workspace.id).select_related("social_account", "assigned_to")[

@@ -20,7 +20,7 @@ def scoped(request: HttpRequest, workspace_id: uuid.UUID) -> WorkspaceMembership
     """
     membership = (
         WorkspaceMembership.objects.select_related("workspace", "workspace__organization", "custom_role")
-        .filter(user=request.user, workspace_id=workspace_id, workspace__is_archived=False)
+        .filter(user=request.user, workspace_id=workspace_id, workspace__is_archived=False)  # type: ignore[misc]
         .first()
     )
     if membership is None:

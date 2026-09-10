@@ -51,7 +51,6 @@ COMMON_TIMEZONES = [
 # Statuses a calendar drop promotes to ``scheduled`` (implicit schedule / retry)
 # rather than merely re-timing. Because that promotion hands the row to the
 # publisher, it is gated on ``publish_directly`` — see ``reschedule_post``.
-_IMPLICIT_SCHEDULE_STATUSES = ("draft", "failed")
 
 
 def _slots_updated_response(account_id):
@@ -1107,7 +1106,6 @@ def publish_tab_sent(request, workspace_id):
 @require_POST
 def reschedule_post(request, workspace_id):
     """HTMX endpoint for drag-and-drop rescheduling of a single PlatformPost."""
-    from apps.composer.services import sync_post_scheduled_at
 
     workspace = _get_workspace(request, workspace_id)
     platform_post_id = request.POST.get("platform_post_id") or request.POST.get("post_id")
@@ -1123,58 +1121,25 @@ def reschedule_post(request, workspace_id):
     )
     post = pp.post
 
-    # Only draggable statuses can be rescheduled (published/publishing can't).
-    if not pp.is_reschedulable:
-        return JsonResponse({"error": "Post cannot be rescheduled in its current status."}, status=400)
-
-    # Check RBAC
     membership = request.workspace_membership
     perms = membership.effective_permissions if membership else {}
-    is_own_post = post.author_id == request.user.id
-    can_edit = is_own_post or perms.get("edit_others_posts", False)
-    if not can_edit:
-        return JsonResponse({"error": "Permission denied."}, status=403)
-    # Dropping a draft/failed chip promotes it to "scheduled" below, which is the
-    # publish privilege every other scheduling path gates on (the composer's chip
-    # transition, save_post's publish-now branch, REST /schedule). Reject rather
-    # than silently degrading the drop to a time-only move.
-    if pp.status in _IMPLICIT_SCHEDULE_STATUSES and not perms.get("publish_directly", False):
-        return JsonResponse({"error": "You do not have permission to schedule this post."}, status=403)
-
     try:
         import zoneinfo
 
-        ws_tz = workspace.effective_timezone or "UTC"
-        tz = zoneinfo.ZoneInfo(ws_tz)
+        from .services import RescheduleDeniedError, reschedule_platform_post
+
+        tz = zoneinfo.ZoneInfo(workspace.effective_timezone or "UTC")
         new_dt = datetime.fromisoformat(new_datetime_str)
         if new_dt.tzinfo is None:
             new_dt = new_dt.replace(tzinfo=tz)
-        pp.scheduled_at = new_dt
-        # Dropping a draft or a failed chip onto the calendar is an implicit
-        # (re)schedule / retry: move it into "scheduled" so the publisher picks
-        # it up. Other statuses (approved, scheduled, pending_*) just change
-        # time and keep their editorial status.
-        fields = ["status", "scheduled_at", "updated_at"]
-        if pp.status == "failed":
-            # Retrying: don't carry the previous attempt's failure state into
-            # the fresh one (a stale publish_error renders on the chip, and a
-            # stale retry_count eats the new attempt's retry budget).
-            pp.publish_error = ""
-            pp.retry_count = 0
-            pp.next_retry_at = None
-            fields += ["publish_error", "retry_count", "next_retry_at"]
-        if pp.status in _IMPLICIT_SCHEDULE_STATUSES and pp.can_transition_to("scheduled"):
-            pp.transition_to("scheduled")
-        pp.save(update_fields=fields)
-        # Keep any queue entry's slot mirror in step with the manual reschedule
-        # so the queue list shows the real time (the slot ops read scheduled_at,
-        # but the detail page still orders by assigned_slot_datetime).
-        QueueEntry.objects.filter(post=post, queue__social_account=pp.social_account).update(
-            assigned_slot_datetime=new_dt
-        )
-        sync_post_scheduled_at(post)
     except (ValueError, TypeError) as e:
         return JsonResponse({"error": f"Invalid datetime: {e}"}, status=400)
+    try:
+        reschedule_platform_post(pp, new_dt, user=request.user, perms=perms)
+    except RescheduleDeniedError as e:
+        return JsonResponse({"error": str(e)}, status=403)
+    except ValueError as e:
+        return JsonResponse({"error": str(e)}, status=400)
 
     return HttpResponse(
         status=204,

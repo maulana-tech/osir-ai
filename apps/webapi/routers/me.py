@@ -17,7 +17,7 @@ def _workspace_entry(m: WorkspaceMembership) -> dict:
     return {
         "id": str(ws.id),
         "name": ws.name,
-        "role": m.custom_role.name if m.custom_role_id else m.workspace_role,
+        "role": m.custom_role.name if m.custom_role is not None else m.workspace_role,
         "timezone": ws.timezone or "UTC",
         "agent_autonomy": ws.agent_autonomy,
         "approval_workflow_mode": ws.approval_workflow_mode,
