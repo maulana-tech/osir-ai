@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { LineChart, Sparkline } from "@/app/components/analytics/Sparkline";
+import { PostDrawer } from "@/app/components/analytics/PostDrawer";
 import { Empty, PageHeader, Section } from "@/app/components/ui";
 import { StudioError, studio } from "@/lib/studio";
 import type { AccountAnalytics, Derived, MetricCard } from "@/lib/types.analytics";
@@ -68,9 +69,11 @@ export default async function AccountAnalyticsPage({ params, searchParams }: { p
   };
   const a = data.account;
   const table = data.table;
+  const openPost = typeof q.post === "string" ? q.post : "";
 
   return (
     <div className="space-y-6">
+      {openPost && <PostDrawer workspaceId={workspaceId} postId={openPost} closeHref={href({ post: undefined })} />}
       <PageHeader title="Analytics">
         <div className="flex items-center gap-2 text-xs">
           {data.range_choices.map((r) => (
@@ -205,9 +208,9 @@ export default async function AccountAnalyticsPage({ params, searchParams }: { p
                   {table.rows.map((r) => (
                     <tr key={r.platform_post_id}>
                       <td className="max-w-md py-2 pr-3">
-                        <a href={`/workspace/${workspaceId}/analytics/posts/${r.post_id}/`} className="line-clamp-2 hover:underline">
+                        <Link href={href({ post: r.platform_post_id })} className="line-clamp-2 hover:underline">
                           {r.caption || "(no caption)"}
-                        </a>
+                        </Link>
                         <span className="text-[11px]" style={{ color: "var(--muted)" }}>
                           {r.media_kind}
                         </span>

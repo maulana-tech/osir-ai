@@ -17,7 +17,7 @@ from django.utils import timezone
 from ninja import Router, Schema
 from ninja.errors import HttpError
 
-from apps.calendar.models import PostingSlot
+from apps.calendar.models import CustomCalendarEvent, PostingSlot
 from apps.calendar.services import RescheduleDeniedError, reschedule_platform_post
 from apps.composer.models import ContentCategory, PlatformPost, Post, Tag
 from apps.social_accounts.models import SocialAccount
@@ -185,6 +185,19 @@ def calendar(
         "can_edit_others": bool(membership.effective_permissions.get("edit_others_posts")),
         "chips": [_chip(pp) for pp in chips],
         "open_slots": open_slots,
+        "events": [
+            {
+                "id": str(e.id),
+                "title": e.title,
+                "description": e.description,
+                "start_date": e.start_date.isoformat(),
+                "end_date": e.end_date.isoformat(),
+                "color": e.color,
+            }
+            for e in CustomCalendarEvent.objects.filter(
+                workspace=workspace, start_date__lte=end_date, end_date__gte=start_date
+            ).order_by("start_date")
+        ],
         "unscheduled_drafts": [
             {"id": str(p.id), "title": p.title, "caption": p.caption[:140], "updated_at": p.updated_at.isoformat()}
             for p in drafts

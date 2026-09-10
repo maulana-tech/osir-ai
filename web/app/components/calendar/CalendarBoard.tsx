@@ -5,7 +5,8 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { addDays, addMonths, dayLabel, monthGrid, pad, periodLabel, toLocal, weekStart } from "@/lib/calendar";
 import { call } from "@/lib/client";
-import type { CalendarData, Chip, OpenSlot } from "@/lib/types.calendar";
+import type { CalendarData, CalendarEvent, Chip, OpenSlot } from "@/lib/types.calendar";
+import { EventModal } from "./EventModal";
 
 type View = "month" | "week" | "day";
 
@@ -58,6 +59,9 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
   const tz = data.display_timezone;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [eventEdit, setEventEdit] = useState<Partial<CalendarEvent> | null>(null);
   const base = { view, date, tz: tz === data.workspace_timezone ? undefined : tz, channel: channels, status: statuses };
 
   const step = (n: number) => (view === "month" ? addMonths(date, n) : addDays(date, view === "week" ? 7 * n : n));
@@ -84,6 +88,34 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
     const k = `${l.date}|${l.hour}`;
     slotsByHour.set(k, [...(slotsByHour.get(k) ?? []), s]);
   }
+
+  const eventsByDay = new Map<string, CalendarEvent[]>();
+  for (const ev of data.events) {
+    for (let d = ev.start_date; d <= ev.end_date && d <= addDays(data.end, 1); d = addDays(d, 1)) {
+      eventsByDay.set(d, [...(eventsByDay.get(d) ?? []), ev]);
+    }
+  }
+
+  async function bulk(action: "draft" | "delete" | "publish") {
+    const ids = [...selected];
+    if (!ids.length) return;
+    if (action === "delete" && !window.confirm(`Delete ${ids.length} selected post${ids.length === 1 ? "" : "s"}?`)) return;
+    if (action === "publish" && !window.confirm(`Publish ${ids.length} selected post${ids.length === 1 ? "" : "s"} now?`)) return;
+    setError(null);
+    try {
+      await call(`/api/web/workspaces/${workspaceId}/calendar/bulk`, { method: "POST", body: JSON.stringify({ action, platform_post_ids: ids }) });
+      setSelected(new Set());
+      router.refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Bulk action failed");
+    }
+  }
+
+  const EventBar = ({ ev }: { ev: CalendarEvent }) => (
+    <button className="block w-full truncate rounded px-1.5 text-left text-[11px] leading-4" style={{ background: ev.color, color: "#fff" }} title={ev.description || ev.title} onClick={() => setEventEdit(ev)}>
+      {ev.title}
+    </button>
+  );
 
   async function drop(chipId: string, newLocal: string) {
     setError(null);
@@ -114,7 +146,8 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
 
   const ChipView = ({ c, compact }: { c: Chip; compact?: boolean }) => {
     const l = c.at ? toLocal(c.at, tz) : null;
-    return (
+    const selectable = c.status !== "published" && c.status !== "publishing";
+    const link = (
       <a
         href={`/w/${workspaceId}/compose/${c.post_id}`}
         draggable={c.is_reschedulable}
@@ -127,6 +160,25 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
         {l && <span>{`${pad(l.hour)}:${pad(l.minute)}`}</span>}
         {!compact && <span> · {c.title || c.caption || "(no caption)"}</span>}
       </a>
+    );
+    if (!selecting) return link;
+    return (
+      <div className="flex items-center gap-1">
+        <input
+          type="checkbox"
+          disabled={!selectable}
+          checked={selected.has(c.id)}
+          onChange={(e) =>
+            setSelected((s) => {
+              const n = new Set(s);
+              if (e.target.checked) n.add(c.id);
+              else n.delete(c.id);
+              return n;
+            })
+          }
+        />
+        <div className="min-w-0 flex-1">{link}</div>
+      </div>
     );
   };
 
@@ -165,6 +217,19 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
         ))}
         <Link className="btn" href={href(workspaceId, { ...base, view: "list" })}>
           list
+        </Link>
+        <span className="mx-1" />
+        <button className={`btn ${selecting ? "btn-accent" : ""}`} onClick={() => { setSelecting((v) => !v); setSelected(new Set()); }}>
+          {selecting ? "done" : "select"}
+        </button>
+        <button className="btn" onClick={() => setEventEdit({ start_date: date, end_date: date, color: "#0a0a0a" })}>
+          + event
+        </button>
+        <Link className="btn" href={`/w/${workspaceId}/calendar/slots`}>
+          slots
+        </Link>
+        <Link className="btn" href={`/w/${workspaceId}/calendar/queues`}>
+          queues
         </Link>
       </div>
       <select
@@ -247,6 +312,9 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
                       </a>
                     )}
                   </div>
+                  {(eventsByDay.get(d) ?? []).map((ev) => (
+                    <EventBar key={ev.id} ev={ev} />
+                  ))}
                   {chips.slice(0, 4).map((c) => (
                     <ChipView key={c.id} c={c} compact />
                   ))}
@@ -273,8 +341,11 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
         <div className="grid" style={{ gridTemplateColumns: `4rem repeat(${days.length}, minmax(0, 1fr))` }}>
           <div className="border-b" style={{ borderColor: "var(--line)" }} />
           {days.map((d) => (
-            <div key={d} className="border-b border-l px-2 py-1.5 text-xs font-semibold" style={{ borderColor: "var(--line)", color: d === data.today ? "#0a0a0a" : "var(--muted)" }}>
+            <div key={d} className="space-y-0.5 border-b border-l px-2 py-1.5 text-xs font-semibold" style={{ borderColor: "var(--line)", color: d === data.today ? "#0a0a0a" : "var(--muted)" }}>
               {dayLabel(d)}
+              {(eventsByDay.get(d) ?? []).map((ev) => (
+                <EventBar key={ev.id} ev={ev} />
+              ))}
             </div>
           ))}
           {Array.from({ length: 24 }, (_, h) => (
@@ -320,6 +391,26 @@ export function CalendarBoard({ workspaceId, view, date, data, channels, statuse
           {error}
         </div>
       )}
+      {selecting && selected.size > 0 && (
+        <div className="fixed bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full border bg-white px-4 py-2 text-sm shadow-lg" style={{ borderColor: "var(--line)" }}>
+          <span className="font-semibold">{selected.size} selected</span>
+          <button className="btn" onClick={() => bulk("draft")}>
+            Unschedule
+          </button>
+          {data.can_publish_directly && (
+            <button className="btn btn-ok" onClick={() => bulk("publish")}>
+              Publish now
+            </button>
+          )}
+          <button className="btn btn-bad" onClick={() => bulk("delete")}>
+            Delete
+          </button>
+          <button className="btn" onClick={() => setSelected(new Set())}>
+            Clear
+          </button>
+        </div>
+      )}
+      {eventEdit && <EventModal workspaceId={workspaceId} event={eventEdit} onClose={() => setEventEdit(null)} />}
       <div className="grid gap-6 lg:grid-cols-[1fr_16rem]">
         {body}
         <aside className="space-y-4">

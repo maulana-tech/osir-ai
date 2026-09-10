@@ -555,3 +555,127 @@ def reschedule_platform_post(pp, new_dt, *, user, perms):
     QueueEntry.objects.filter(post=post, queue__social_account=pp.social_account).update(assigned_slot_datetime=new_dt)
     sync_post_scheduled_at(post)
     return pp
+
+
+# ---------------------------------------------------------------------------
+# Bulk actions on the Publish page's selection (shared by the Django view and the web API)
+# ---------------------------------------------------------------------------
+
+BULK_ACTIONS = ("draft", "delete", "publish")
+
+
+def _bulk_save_platform_posts(rows):
+    """Persist the fields the bulk actions mutate, in one statement (stamping ``updated_at``)."""
+    from apps.composer.models import PlatformPost
+
+    if not rows:
+        return
+    stamp = timezone.now()
+    for row in rows:
+        row.updated_at = stamp
+    PlatformPost.objects.bulk_update(
+        rows, ["status", "scheduled_at", "publish_error", "retry_count", "next_retry_at", "updated_at"]
+    )
+
+
+def _sync_queue_entries(touched):
+    """Keep queue mirrors in step: ``(platform_post, new_slot_dt | None)`` → drop or move the entry."""
+    drop, move = [], {}
+    for pp, slot in touched:
+        if slot is None:
+            drop.append((pp.post_id, pp.social_account_id))
+        else:
+            move.setdefault(slot, []).append((pp.post_id, pp.social_account_id))
+    for post_id, account_id in drop:
+        QueueEntry.objects.filter(post_id=post_id, queue__social_account_id=account_id).delete()
+    for slot, pairs in move.items():
+        for post_id, account_id in pairs:
+            QueueEntry.objects.filter(post_id=post_id, queue__social_account_id=account_id).update(
+                assigned_slot_datetime=slot
+            )
+
+
+def bulk_platform_action(workspace, user, perms, action, pp_ids) -> int:
+    """Draft / delete / publish-now the selected PlatformPosts. Returns the number of rows acted on.
+
+    Only rows the person may edit are touched; ``published`` / ``publishing``
+    rows are never deleted or moved. Publishing staggers same-channel rows a
+    minute apart. Raises ValueError for bad input and PermissionError when
+    publishing without ``publish_directly``.
+    """
+    from django.db import transaction
+    from django.db.models import F
+    from django.db.models.functions import Coalesce
+
+    from apps.composer.models import PlatformPost, Post
+    from apps.composer.services import sync_post_scheduled_at
+
+    if action not in BULK_ACTIONS or not pp_ids:
+        raise ValueError("action and platform_post_ids required")
+    if action == "publish" and not perms.get("publish_directly", False):
+        raise PermissionError("You do not have permission to publish directly.")
+
+    pps = list(
+        PlatformPost.objects.filter(id__in=pp_ids, post__workspace=workspace)
+        .select_related("post")
+        .annotate(effective_at=Coalesce("scheduled_at", "post__scheduled_at"))
+        .order_by(F("effective_at").asc(nulls_last=True), "post__created_at", "id")
+    )
+    can_edit_others = perms.get("edit_others_posts", False)
+    pps = [pp for pp in pps if pp.post.author_id == user.id or can_edit_others]
+
+    affected = set()
+    touched: list[tuple] = []
+    with transaction.atomic():
+        if action == "delete":
+            deletable = [pp for pp in pps if pp.status not in PlatformPost.PROTECTED_STATUSES]
+            for pp in deletable:
+                affected.add(pp.post_id)
+                touched.append((pp, None))
+            PlatformPost.objects.filter(id__in=[pp.id for pp in deletable]).delete()
+            count = len(deletable)
+        elif action == "draft":
+            changed = []
+            for pp in pps:
+                if pp.status in PlatformPost.PROTECTED_STATUSES or pp.status == "draft":
+                    continue
+                if not pp.can_transition_to("draft"):
+                    continue
+                pp.scheduled_at = None
+                pp.transition_to("draft")
+                changed.append(pp)
+                affected.add(pp.post_id)
+                touched.append((pp, None))
+            _bulk_save_platform_posts(changed)
+            count = len(changed)
+        else:
+            now = timezone.now()
+            per_channel: dict = {}
+            changed = []
+            for pp in pps:
+                if pp.status in PlatformPost.PROTECTED_STATUSES:
+                    continue
+                if pp.status != "scheduled" and not pp.can_transition_to("scheduled"):
+                    continue
+                slot = now + timedelta(minutes=per_channel.get(pp.social_account_id, 0))
+                per_channel[pp.social_account_id] = per_channel.get(pp.social_account_id, 0) + 1
+                pp.scheduled_at = slot
+                if pp.status == "failed":
+                    pp.publish_error = ""
+                    pp.retry_count = 0
+                    pp.next_retry_at = None
+                if pp.status != "scheduled":
+                    pp.transition_to("scheduled")
+                changed.append(pp)
+                affected.add(pp.post_id)
+                touched.append((pp, slot))
+            _bulk_save_platform_posts(changed)
+            count = len(changed)
+
+        _sync_queue_entries(touched)
+        for post in Post.objects.filter(id__in=affected, workspace=workspace).prefetch_related("platform_posts"):
+            if not post.platform_posts.all():
+                post.delete()
+            else:
+                sync_post_scheduled_at(post)
+    return count

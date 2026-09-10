@@ -71,3 +71,17 @@ export interface AnalyticsIndex {
   accounts: AnalyticsAccount[];
   preferred_account_id: string | null;
 }
+
+export interface PostDetail {
+  id: string;
+  post_id: string;
+  account: { id: string; name: string; handle: string; platform: string; avatar_url: string };
+  caption: string;
+  date: string;
+  days_ago: number | null;
+  media_kind: string;
+  media_preview: { url: string; kind: string } | null;
+  captured_at: string | null;
+  platform_post_id: string;
+  metric_tiles: { key: string; label: string; value: number; kind: string; sparkline: number[]; is_primary: boolean }[];
+}

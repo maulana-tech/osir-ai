@@ -25,6 +25,8 @@ from .routers.inbox import router as inbox_router
 from .routers.me import router as me_router
 from .routers.media import org_router as media_org_router
 from .routers.media import router as media_router
+from .routers.scheduling import org_router as scheduling_org_router
+from .routers.scheduling import router as scheduling_router
 from .routers.workspaces import router as workspaces_router
 
 api = NinjaAPI(
@@ -45,6 +47,8 @@ api.add_router("/workspaces", admin_router)
 api.add_router("/workspaces", approvals_router)
 api.add_router("/workspaces", media_router)
 api.add_router("/workspaces", composer_router)
+api.add_router("/workspaces", scheduling_router)
+api.add_router("/org", scheduling_org_router)
 api.add_router("/org", org_router)
 api.add_router("/org", media_org_router)
 api.add_router("/me", account_router)

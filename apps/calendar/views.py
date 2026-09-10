@@ -1147,177 +1147,23 @@ def reschedule_post(request, workspace_id):
     )
 
 
-def _bulk_save_platform_posts(rows):
-    """Persist the fields the bulk actions mutate, in one statement.
-
-    ``PlatformPost`` has no save signals, so ``bulk_update`` is equivalent to a
-    per-row ``save(update_fields=...)`` here and turns an N-query loop into one.
-    ``updated_at`` is ``auto_now``, which ``bulk_update`` does not apply, so it
-    is stamped explicitly — same reason the per-row saves list it.
-    """
-    from django.utils import timezone as _tz
-
-    if not rows:
-        return
-    stamp = _tz.now()
-    for row in rows:
-        row.updated_at = stamp
-    PlatformPost.objects.bulk_update(
-        rows,
-        ["status", "scheduled_at", "publish_error", "retry_count", "next_retry_at", "updated_at"],
-    )
-
-
-def _sync_queue_entries(touched):
-    """Keep queue mirrors in step with rows a bulk action just changed.
-
-    ``touched`` is ``(platform_post, new_slot_datetime | None)``. A row that was
-    deleted or sent back to draft leaves its queue — matching
-    ``services.remove_from_queue``, which deletes the entry rather than leaving
-    it pointing at an unscheduled post. A row that moved in time carries its
-    entry's ``assigned_slot_datetime`` along, matching ``reschedule_post``.
-    Without this the queue detail page (which orders by that column) keeps
-    showing the old slot, and a deleted child on a multi-platform post strands
-    an entry whose channel no longer has a row.
-    """
-    drop, move = [], {}
-    for pp, slot in touched:
-        if slot is None:
-            drop.append((pp.post_id, pp.social_account_id))
-        else:
-            move.setdefault(slot, []).append((pp.post_id, pp.social_account_id))
-
-    for post_id, account_id in drop:
-        QueueEntry.objects.filter(post_id=post_id, queue__social_account_id=account_id).delete()
-    for slot, pairs in move.items():
-        for post_id, account_id in pairs:
-            QueueEntry.objects.filter(post_id=post_id, queue__social_account_id=account_id).update(
-                assigned_slot_datetime=slot
-            )
-
-
 @login_required
 @require_POST
 def bulk_platform_action(request, workspace_id):
-    """Bulk draft / delete / publish on the checkbox-selected PlatformPosts.
-
-    Powers the Publish page's floating selection bar (list + calendar). Only
-    rows the user may edit are touched, and ``published``/``publishing`` rows
-    are never deleted or moved. Returns the number of rows acted on.
-
-    The whole mutation runs in one transaction: it spans N platform rows, their
-    queue mirrors and the parent-Post reconciliation, and a half-applied bulk
-    action would leave parents whose ``scheduled_at`` aggregate points at
-    children that no longer exist.
-    """
-    from django.db import transaction
-    from django.db.models import F
-    from django.db.models.functions import Coalesce
-    from django.utils import timezone as _tz
-
-    from apps.composer.services import sync_post_scheduled_at
+    """Bulk draft / delete / publish on the checkbox-selected PlatformPosts (the selection bar)."""
+    from .services import bulk_platform_action as _bulk
 
     workspace = _get_workspace(request, workspace_id)
     action = request.POST.get("action")
     pp_ids = request.POST.getlist("platform_post_ids")
-    if action not in ("draft", "delete", "publish") or not pp_ids:
-        return JsonResponse({"error": "action and platform_post_ids required"}, status=400)
-
     membership = getattr(request, "workspace_membership", None)
     perms = membership.effective_permissions if membership else {}
-    # Publishing now hands rows straight to the publisher's poll loop, skipping
-    # the approval workflow — the privilege the composer's chip transition,
-    # save_post's publish-now branch and REST /schedule all gate on. Draft and
-    # delete stay under plain edit rights.
-    if action == "publish" and not perms.get("publish_directly", False):
-        return JsonResponse({"error": "You do not have permission to publish directly."}, status=403)
-
-    # Ordered by the time each row is currently due, because the publish branch
-    # staggers same-channel rows in iteration order — an unordered ``id__in``
-    # would hand out those offsets in arbitrary database order and could publish
-    # a later-scheduled Queue post ahead of an earlier one. Rows with no time at
-    # all (drafts) sort last, then by creation so the order is fully determined.
-    pps = list(
-        PlatformPost.objects.filter(id__in=pp_ids, post__workspace=workspace)
-        .select_related("post")
-        .annotate(effective_at=Coalesce("scheduled_at", "post__scheduled_at"))
-        .order_by(F("effective_at").asc(nulls_last=True), "post__created_at", "id")
-    )
-    can_edit_others = perms.get("edit_others_posts", False)
-    pps = [pp for pp in pps if pp.post.author_id == request.user.id or can_edit_others]
-
-    affected = set()
-    touched = []  # rows whose queue mirror must follow, as (pp, new_slot_dt|None)
-    with transaction.atomic():
-        if action == "delete":
-            deletable = [pp for pp in pps if pp.status not in PlatformPost.PROTECTED_STATUSES]
-            for pp in deletable:
-                affected.add(pp.post_id)
-                touched.append((pp, None))
-            PlatformPost.objects.filter(id__in=[pp.id for pp in deletable]).delete()
-            count = len(deletable)
-        elif action == "draft":
-            # Unschedule: back to draft and drop the time.
-            changed = []
-            for pp in pps:
-                if pp.status in PlatformPost.PROTECTED_STATUSES or pp.status == "draft":
-                    continue
-                if not pp.can_transition_to("draft"):
-                    continue
-                pp.scheduled_at = None
-                pp.transition_to("draft")
-                changed.append(pp)
-                affected.add(pp.post_id)
-                touched.append((pp, None))
-            _bulk_save_platform_posts(changed)
-            count = len(changed)
-        else:
-            # Publish now. Rows on the same channel are staggered a minute apart
-            # rather than all stamped with the same instant: posting slots exist
-            # to space a channel's output, and firing eight posts at one account
-            # in the same publisher tick invites rate limiting.
-            now = _tz.now()
-            per_channel: dict = {}
-            changed = []
-            for pp in pps:
-                if pp.status in PlatformPost.PROTECTED_STATUSES:
-                    continue
-                # scheduled → scheduled is not a valid transition (the whole Queue
-                # tab is `scheduled`), so those rows only move in time — the
-                # publisher takes any scheduled row whose effective time passed.
-                if pp.status != "scheduled" and not pp.can_transition_to("scheduled"):
-                    continue
-                slot = now + timedelta(minutes=per_channel.get(pp.social_account_id, 0))
-                per_channel[pp.social_account_id] = per_channel.get(pp.social_account_id, 0) + 1
-                pp.scheduled_at = slot
-                if pp.status == "failed":
-                    # Retrying: the previous attempt's failure state must not
-                    # ride along into the fresh one.
-                    pp.publish_error = ""
-                    pp.retry_count = 0
-                    pp.next_retry_at = None
-                if pp.status != "scheduled":
-                    pp.transition_to("scheduled")
-                changed.append(pp)
-                affected.add(pp.post_id)
-                touched.append((pp, slot))
-            _bulk_save_platform_posts(changed)
-            count = len(changed)
-
-        _sync_queue_entries(touched)
-
-        # Reconcile each touched parent Post (aggregate scheduled_at) and drop any
-        # post whose last platform row was just deleted. Fetched in one query with
-        # the children prefetched, so the loop below adds none.
-        posts = Post.objects.filter(id__in=affected, workspace=workspace).prefetch_related("platform_posts")
-        for post in posts:
-            if not post.platform_posts.all():
-                post.delete()
-            else:
-                sync_post_scheduled_at(post)
-
-    # Plain JSON, not an HX-Trigger header: the selection bar posts with fetch(),
-    # not htmx, and fires its own calendar/tab refresh events on success.
+    try:
+        count = _bulk(workspace, request.user, perms, action, pp_ids)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except PermissionError as exc:
+        return JsonResponse({"error": str(exc)}, status=403)
     return JsonResponse({"action": action, "count": count})
 
 

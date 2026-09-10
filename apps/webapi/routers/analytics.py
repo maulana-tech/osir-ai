@@ -6,6 +6,7 @@ import dataclasses
 import uuid
 
 from django.db.models import QuerySet
+from django.shortcuts import get_object_or_404
 from ninja import Router
 from ninja.errors import HttpError
 
@@ -164,3 +165,47 @@ def account(
         }
     )
     return payload
+
+
+@router.get("/{workspace_id}/analytics/posts/{uuid:platform_post_id}", summary="One published post's metrics")
+def post_detail(request, workspace_id: uuid.UUID, platform_post_id: uuid.UUID):
+    m = scoped(request, workspace_id)
+    require_perm(m, "view_analytics")
+    pp = get_object_or_404(
+        PlatformPost.objects.select_related("social_account", "post").prefetch_related(
+            "post__media_attachments__media_asset"
+        ),
+        id=platform_post_id,
+        social_account__workspace=m.workspace,
+    )
+    d = services.post_detail(pp)
+    a = d["account"]
+    return {
+        "id": str(pp.id),
+        "post_id": str(pp.post_id),
+        "account": {
+            "id": str(a.id),
+            "name": a.account_name,
+            "handle": a.account_handle,
+            "platform": a.platform,
+            "avatar_url": a.avatar_url or "",
+        },
+        "caption": d["caption"],
+        "date": d["date"],
+        "days_ago": d["days_ago"],
+        "media_kind": d["media_kind"],
+        "media_preview": d["media_preview"],
+        "captured_at": d["captured_at"].isoformat() if d["captured_at"] else None,
+        "platform_post_id": pp.platform_post_id,
+        "metric_tiles": [
+            {
+                "key": t["key"],
+                "label": t["label"],
+                "value": t["value"],
+                "kind": t["kind"],
+                "sparkline": list(t["sparkline"]),
+                "is_primary": t["is_primary"],
+            }
+            for t in d["metric_tiles"]
+        ],
+    }

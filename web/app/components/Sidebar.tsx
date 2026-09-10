@@ -123,6 +123,7 @@ export function Sidebar({ me, workspace, sidebar }: { me: Me; workspace: Workspa
             <>
               {orgAdmin && <NavLink href="/org/settings">Organization</NavLink>}
               <NavLink href="/org/workspaces">Workspaces</NavLink>
+              <NavLink href="/org/calendar">All-workspace calendar</NavLink>
               <NavLink href="/org/members">Team</NavLink>
               <NavLink href="/org/media">Shared media</NavLink>
               {(orgAdmin || can("manage_api_keys")) && <NavLink href="/org/api-keys">API keys</NavLink>}
