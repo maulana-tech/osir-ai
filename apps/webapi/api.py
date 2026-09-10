@@ -13,6 +13,7 @@ from ninja import NinjaAPI
 
 from apps.api.auth import WebSessionAuth
 
+from .routers.analytics import router as analytics_router
 from .routers.calendar import router as calendar_router
 from .routers.inbox import router as inbox_router
 from .routers.me import router as me_router
@@ -30,3 +31,4 @@ api.add_router("/me", me_router)
 api.add_router("/workspaces", workspaces_router)
 api.add_router("/workspaces", calendar_router)
 api.add_router("/workspaces", inbox_router)
+api.add_router("/workspaces", analytics_router)
