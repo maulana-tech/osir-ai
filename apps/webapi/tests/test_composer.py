@@ -246,3 +246,69 @@ class TestComposer:
         r = _send(member_client, "post", f"/api/web/workspaces/{ws}/composer/csv/confirm")
         assert r.json()["created_count"] == 1
         assert Post.objects.filter(workspace=workspace, caption="Hello", platform_posts__status="scheduled").exists()
+
+    def test_malformed_account_scope_rejected(self, member_client, workspace, accounts):
+        # A non-UUID scope is a crafted/corrupted request: Pydantic rejects it
+        # before any row is touched.
+        yt, _ = accounts
+        r = _send(
+            member_client,
+            "post",
+            f"/api/web/workspaces/{workspace.id}/composer/posts",
+            {"caption": "x", "accounts": [{"id": str(yt.id)}], "account_scope": "not-a-uuid"},
+        )
+        assert r.status_code == 422
+        assert not Post.objects.filter(workspace=workspace).exists()
+
+    def test_saved_templates_scoped_to_workspace(self, member_client, workspace, second_workspace, org_owner):
+        PostTemplate.objects.create(
+            workspace=workspace, name="Mine", template_data={"caption": "v"}, created_by=org_owner
+        )
+        PostTemplate.objects.create(
+            workspace=second_workspace, name="Secret", template_data={"caption": "h"}, created_by=org_owner
+        )
+        saved = member_client.get(f"/api/web/workspaces/{workspace.id}/composer/templates").json()["saved"]
+        assert [t["name"] for t in saved] == ["Mine"]
+
+    def test_csv_upload_rejects_oversized_file(self, member_client, workspace):
+        import io
+
+        from apps.composer import csv_import
+
+        token = secrets.token_hex(16)
+        member_client.cookies["csrftoken"] = token
+        f = io.BytesIO(b"a" * (csv_import.MAX_UPLOAD_BYTES + 1))
+        f.name = "big.csv"
+        r = member_client.post(
+            f"/api/web/workspaces/{workspace.id}/composer/csv/upload", {"csv_file": f}, HTTP_X_CSRFTOKEN=token
+        )
+        assert r.status_code == 400 and "too large" in r.json()["detail"]
+
+    def test_unsplash_search_maps_service_errors(self, member_client, workspace, settings):
+        from unittest.mock import MagicMock, patch
+
+        url = f"/api/web/workspaces/{workspace.id}/composer/unsplash?q=coffee"
+        settings.UNSPLASH_ACCESS_KEY = ""
+        assert member_client.get(url).status_code == 503
+        settings.UNSPLASH_ACCESS_KEY = "k"
+        resp = MagicMock(status_code=200)
+        resp.json = MagicMock(return_value={"total": 0, "results": []})
+        with patch("apps.composer.unsplash.httpx.get", return_value=resp):
+            assert member_client.get(url).json() == {"results": [], "total": 0}
+
+    def test_idea_edit_ignores_unknown_group_and_clears_tags(self, member_client, workspace, second_workspace):
+        import uuid
+
+        ws = workspace.id
+        board = member_client.get(f"/api/web/workspaces/{ws}/composer/ideas").json()
+        todo, done = board["columns"][1]["id"], board["columns"][3]["id"]
+        idea_id = _send(
+            member_client, "post", f"/api/web/workspaces/{ws}/composer/ideas", {"title": "I", "tags": ["keep"]}
+        ).json()["id"]
+        url = f"/api/web/workspaces/{ws}/composer/ideas/{idea_id}"
+        assert _send(member_client, "patch", url, {"title": "I", "group_id": done}).json()["group_id"] == done
+        foreign = IdeaGroup.objects.create(workspace=second_workspace, name="X", position=0)
+        for bad in (str(uuid.uuid4()), str(foreign.id)):
+            body = _send(member_client, "patch", url, {"title": "I", "group_id": bad}).json()
+            assert body["group_id"] == done and body["tags"] == []
+        assert todo != done and Idea.objects.get(id=idea_id).tags == []

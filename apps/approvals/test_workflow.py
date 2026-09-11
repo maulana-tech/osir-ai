@@ -238,77 +238,73 @@ class ApprovedEditReReviewTests(ApprovalWorkflowBase):
         super().setUp()
         self.post = self._post("approved")
         self.client.force_login(self.author)
-        self.save_url = reverse("composer:save_post_edit", kwargs={"workspace_id": self.ws.id, "post_id": self.post.id})
+        self.save_url = f"/api/web/workspaces/{self.ws.id}/composer/posts/{self.post.id}"
 
-    def _payload(self, **overrides):
-        data = {
-            "action": "save_draft",
-            "title": "",
-            "caption": self.post.caption,
-            "tags": "",
-            "selected_accounts": str(self.account.id),
-        }
+    def _save(self, **overrides):
+        data = {"action": "save_draft", "caption": self.post.caption, "accounts": [{"id": str(self.account.id)}]}
         data.update(overrides)
-        return data
+        resp = self.client.post(self.save_url, data=json.dumps(data), content_type="application/json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp
+
+    def _status(self):
+        return self.post.platform_posts.get().status
 
     def test_resubmit_service_accepts_approved(self):
         services.resubmit_post(self.post, self.author, self.ws)
-        self.assertEqual(self.post.platform_posts.get().status, "pending_review")
+        self.assertEqual(self._status(), "pending_review")
 
     def test_editing_approved_post_reverts_to_pending_review(self):
-        resp = self.client.post(self.save_url, data=self._payload(caption="A meaningfully edited caption"))
-        self.assertIn(resp.status_code, (200, 204, 302))
-        self.assertEqual(self.post.platform_posts.get().status, "pending_review")
+        self._save(caption="A meaningfully edited caption")
+        self.assertEqual(self._status(), "pending_review")
 
     def test_unchanged_save_keeps_approved(self):
-        resp = self.client.post(self.save_url, data=self._payload())
-        self.assertIn(resp.status_code, (200, 204, 302))
-        self.assertEqual(self.post.platform_posts.get().status, "approved")
+        self._save()
+        self.assertEqual(self._status(), "approved")
+
+    def _when(self):
+        from datetime import timedelta
+
+        when = timezone.now() + timedelta(days=1)
+        return {"scheduled_date": when.strftime("%Y-%m-%d"), "scheduled_time": when.strftime("%H:%M")}
 
     def test_scheduling_edited_approved_post_does_not_publish(self):
-        # Finding 1: a schedule action in the SAME save as a content edit must not
-        # push the edited (no-longer-approved) content straight to scheduled — it
-        # goes back for re-review instead.
-        from datetime import timedelta
-
-        when = timezone.now() + timedelta(days=1)
-        resp = self.client.post(
-            self.save_url,
-            data=self._payload(
-                action="schedule",
-                caption="Edited and scheduled in one save",
-                scheduled_date=when.strftime("%Y-%m-%d"),
-                scheduled_time=when.strftime("%H:%M"),
-            ),
-        )
-        self.assertIn(resp.status_code, (200, 204, 302))
-        self.assertEqual(self.post.platform_posts.get().status, "pending_review")
+        # A schedule action in the SAME save as a content edit must not push the
+        # edited (no-longer-approved) content straight to scheduled.
+        self._save(action="schedule", caption="Edited and scheduled in one save", **self._when())
+        self.assertEqual(self._status(), "pending_review")
 
     def test_scheduling_unchanged_approved_post_still_schedules(self):
-        # Happy path preserved: scheduling an approved post whose content is
-        # unchanged proceeds straight to scheduled.
-        from datetime import timedelta
-
-        when = timezone.now() + timedelta(days=1)
-        resp = self.client.post(
-            self.save_url,
-            data=self._payload(
-                action="schedule",
-                scheduled_date=when.strftime("%Y-%m-%d"),
-                scheduled_time=when.strftime("%H:%M"),
-            ),
-        )
-        self.assertIn(resp.status_code, (200, 204, 302))
-        self.assertEqual(self.post.platform_posts.get().status, "scheduled")
+        self._save(action="schedule", **self._when())
+        self.assertEqual(self._status(), "scheduled")
 
     def test_autosave_edit_reverts_approved(self):
-        url = reverse("composer:autosave_edit", kwargs={"workspace_id": self.ws.id, "post_id": self.post.id})
-        resp = self.client.post(
-            url, data={"title": "", "caption": "Autosaved different text", "selected_accounts": str(self.account.id)}
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self.post.platform_posts.get().status, "pending_review")
+        self._save(action="autosave", caption="Autosaved different text")
+        self.assertEqual(self._status(), "pending_review")
 
+    def _image_asset(self):
+        from django.core.files.base import ContentFile
+
+        from apps.media_library.models import MediaAsset
+
+        return MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.ws,
+            file=ContentFile(b"x", name="pic.png"),
+            filename="pic.png",
+            media_type=MediaAsset.MediaType.IMAGE,
+        )
+
+    def test_attaching_media_reverts_approved(self):
+        self._save(media_asset_ids=[str(self._image_asset().id)])
+        self.assertEqual(self._status(), "pending_review")
+
+    def test_removing_media_reverts_approved(self):
+        from apps.composer.models import PostMedia
+
+        PostMedia.objects.create(post=self.post, media_asset=self._image_asset(), position=0)
+        self._save(media_asset_ids=[])
+        self.assertEqual(self._status(), "pending_review")
 
 class PortalMixedPostActionTests(TestCase):
     """A pending_client child must expose client actions even when a lower-ranked

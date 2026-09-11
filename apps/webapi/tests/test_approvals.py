@@ -130,10 +130,6 @@ class TestCommentEditScope:
         assert comment.body == "rewritten"
 
 
-# The retired HTMX attach/remove-media views called ``editor.revert_approved_to_review``
-# themselves; ``editor.save`` only re-reviews when ``base_content_snapshot`` (text fields)
-# changes, so a media-only edit through the web API still leaves the post approved.
-@pytest.mark.xfail(strict=True, reason="editor.save does not yet treat a media change as a content change")
 @pytest.mark.django_db
 class TestMediaEditReReview:
     """Changing media on an approved post sends it back for re-approval (Option A)."""
