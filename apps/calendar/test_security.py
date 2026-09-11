@@ -1,11 +1,12 @@
 """Security regression tests for the May-2026 audit.
 
 Covers V2 (hex-color CSS injection), V6 (queue category IDOR), and V7
-(missing role check on custom calendar events).
+(missing role check on custom calendar events) on the web API routes.
 """
 
+import json
+
 from django.test import TestCase
-from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
@@ -28,14 +29,15 @@ def _make_user(email):
     # the user to a specific org must start from a clean slate, otherwise the
     # RBAC middleware (which does OrgMembership.objects.filter(...).first())
     # may pick the auto-org instead of the test org.
-    from apps.members.models import OrgMembership, WorkspaceMembership
-    from apps.organizations.models import Organization
-
     auto_org_ids = list(OrgMembership.objects.filter(user=user).values_list("organization_id", flat=True))
     WorkspaceMembership.objects.filter(user=user).delete()
     OrgMembership.objects.filter(user=user).delete()
     Organization.objects.filter(id__in=auto_org_ids).delete()
     return user
+
+
+def _send(client, method, url, payload):
+    return getattr(client, method)(url, data=json.dumps(payload), content_type="application/json")
 
 
 class CalendarEventColorValidationTests(TestCase):
@@ -50,49 +52,31 @@ class CalendarEventColorValidationTests(TestCase):
         self.viewer = _make_user("viewer@example.com")
         OrgMembership.objects.create(user=self.viewer, organization=self.org, org_role="member")
         WorkspaceMembership.objects.create(user=self.viewer, workspace=self.workspace, workspace_role="viewer")
+        self.url = f"/api/web/workspaces/{self.workspace.id}/calendar/events"
+
+    def _create(self, color):
+        return _send(
+            self.client,
+            "post",
+            self.url,
+            {"title": "Launch", "start_date": "2026-06-01", "end_date": "2026-06-01", "color": color},
+        )
 
     def test_viewer_cannot_create_event(self):
         self.client.force_login(self.viewer)
-        url = reverse("calendar:event_create", kwargs={"workspace_id": self.workspace.id})
-        response = self.client.post(
-            url,
-            data={
-                "title": "Launch",
-                "start_date": "2026-06-01",
-                "end_date": "2026-06-01",
-                "color": "#FF0000",
-            },
-        )
+        response = self._create("#FF0000")
         self.assertEqual(response.status_code, 403)
         self.assertFalse(CustomCalendarEvent.objects.exists())
 
     def test_owner_with_bad_color_is_rejected(self):
         self.client.force_login(self.owner)
-        url = reverse("calendar:event_create", kwargs={"workspace_id": self.workspace.id})
-        response = self.client.post(
-            url,
-            data={
-                "title": "Launch",
-                "start_date": "2026-06-01",
-                "end_date": "2026-06-01",
-                "color": "red;background-image:url('//evil')",
-            },
-        )
+        response = self._create("red;background-image:url('//evil')")
         self.assertEqual(response.status_code, 400)
         self.assertFalse(CustomCalendarEvent.objects.exists())
 
     def test_owner_with_good_color_succeeds(self):
         self.client.force_login(self.owner)
-        url = reverse("calendar:event_create", kwargs={"workspace_id": self.workspace.id})
-        response = self.client.post(
-            url,
-            data={
-                "title": "Launch",
-                "start_date": "2026-06-01",
-                "end_date": "2026-06-01",
-                "color": "#FF0000",
-            },
-        )
+        response = self._create("#FF0000")
         self.assertLess(response.status_code, 400)
         self.assertEqual(CustomCalendarEvent.objects.count(), 1)
 
@@ -106,18 +90,19 @@ class CalendarEventColorValidationTests(TestCase):
             created_by=self.owner,
         )
         self.client.force_login(self.owner)
-        url = reverse(
-            "calendar:event_edit",
-            kwargs={"workspace_id": self.workspace.id, "event_id": event.id},
+        response = _send(
+            self.client,
+            "put",
+            f"{self.url}/{event.id}",
+            {"title": "Existing", "start_date": "2026-06-01", "color": "red;url(x)"},
         )
-        response = self.client.post(url, data={"color": "red;url(x)"})
         self.assertEqual(response.status_code, 400)
         event.refresh_from_db()
         self.assertEqual(event.color, "#3B82F6")
 
 
 class QueueCreateCategoryIdorTests(TestCase):
-    """V6: queue_create must validate category_id against the request workspace."""
+    """V6: queue create must validate category_id against the request workspace."""
 
     def setUp(self):
         self.org = Organization.objects.create(name="Test Org")
@@ -135,13 +120,15 @@ class QueueCreateCategoryIdorTests(TestCase):
             connection_status="connected",
         )
         self.foreign_category = ContentCategory.objects.create(workspace=self.ws_b, name="Foreign", color="#000000")
+        self.url = f"/api/web/workspaces/{self.ws_a.id}/calendar/queues"
+        self.client.force_login(self.user)
 
     def test_foreign_category_id_returns_404(self):
-        self.client.force_login(self.user)
-        url = reverse("calendar:queue_create", kwargs={"workspace_id": self.ws_a.id})
-        response = self.client.post(
-            url,
-            data={
+        response = _send(
+            self.client,
+            "post",
+            self.url,
+            {
                 "name": "Test Queue",
                 "social_account_id": str(self.account.id),
                 "category_id": str(self.foreign_category.id),
@@ -151,14 +138,8 @@ class QueueCreateCategoryIdorTests(TestCase):
         self.assertFalse(Queue.objects.filter(workspace=self.ws_a).exists())
 
     def test_no_category_creates_queue(self):
-        self.client.force_login(self.user)
-        url = reverse("calendar:queue_create", kwargs={"workspace_id": self.ws_a.id})
-        response = self.client.post(
-            url,
-            data={
-                "name": "Test Queue",
-                "social_account_id": str(self.account.id),
-            },
+        response = _send(
+            self.client, "post", self.url, {"name": "Test Queue", "social_account_id": str(self.account.id)}
         )
         self.assertLess(response.status_code, 400)
         self.assertTrue(Queue.objects.filter(workspace=self.ws_a, name="Test Queue").exists())

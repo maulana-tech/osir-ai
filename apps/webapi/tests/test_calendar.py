@@ -10,7 +10,7 @@ import pytest
 from django.utils import timezone
 
 from apps.calendar.models import PostingSlot
-from apps.composer.models import PlatformPost
+from apps.composer.models import PlatformPost, Post
 from apps.composer.services import create_post
 from apps.social_accounts.models import SocialAccount
 
@@ -58,6 +58,25 @@ class TestCalendarWindow:
     def test_window_limits(self, member_client, workspace):
         r = member_client.get(f"/api/web/workspaces/{workspace.id}/calendar?start=2026-01-01&end=2026-06-01")
         assert r.status_code == 400
+
+    def test_status_and_channel_filters_anchor_to_the_same_row(self, member_client, workspace, account):
+        """A post pending on one channel and drafted on another must not surface
+        (or become bulk-actionable) under the other channel + pending filter."""
+        other = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram_business",
+            account_platform_id="ig",
+            account_name="IG",
+            connection_status="connected",
+        )
+        when = timezone.now() + dt.timedelta(days=2)
+        post = Post.objects.create(workspace=workspace, caption="MIXEDROW", scheduled_at=when)
+        PlatformPost.objects.create(post=post, social_account=other, status="pending_review")
+        PlatformPost.objects.create(post=post, social_account=account, status="draft")
+        base = f"/api/web/workspaces/{workspace.id}/calendar?start={when.date()}&end={when.date()}&tz=UTC"
+        base += "&status=pending_review"
+        assert member_client.get(f"{base}&channel={account.id}").json()["chips"] == []
+        assert [c["caption"] for c in member_client.get(f"{base}&channel={other.id}").json()["chips"]] == ["MIXEDROW"]
         r = member_client.get(f"/api/web/workspaces/{workspace.id}/calendar?start=2026-02-01&end=2026-01-01")
         assert r.status_code == 400
 

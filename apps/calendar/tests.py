@@ -5,8 +5,7 @@ from datetime import date, datetime, time, timedelta
 from unittest.mock import patch
 
 from django.core.management import call_command
-from django.test import RequestFactory, TestCase
-from django.urls import reverse
+from django.test import TestCase
 from django.utils import timezone
 
 from apps.accounts.models import User
@@ -23,7 +22,6 @@ from apps.calendar.services import (
     reslot_to_next_available,
 )
 from apps.calendar.tasks import generate_recurring_posts
-from apps.calendar.views import _day_view_data
 from apps.composer.models import PlatformPost, Post
 from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
@@ -60,13 +58,11 @@ class PostingSlotModelTest(TestCase):
 
 
 class PostingSlotCrossWorkspaceTests(TestCase):
-    """Slot endpoints must scope every mutation to the requesting workspace.
+    """Slot routes must scope every mutation to the requesting workspace.
 
     The workspace-scoped query is the single authority: a slot outside the
-    caller's workspace (or already gone) is a uniform no-op that never mutates
-    and never leaks existence via a post-lookup membership check. Treating the
-    miss as a no-op also makes delete/update idempotent, so a stale grid
-    self-heals instead of 404ing.
+    caller's workspace is never mutated, and a delete of a slot that is already
+    gone is a no-op so a stale page self-heals instead of erroring.
     """
 
     def setUp(self):
@@ -119,21 +115,21 @@ class PostingSlotCrossWorkspaceTests(TestCase):
             workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
         )
 
+    @staticmethod
+    def _slot_url(workspace, slot_id):
+        return f"/api/web/workspaces/{workspace.id}/calendar/slots/{slot_id}"
+
     def test_delete_own_workspace_slot_succeeds(self):
         """Happy path: an owner deletes a slot in their own workspace."""
         self.client.force_login(self.user_a)
-        url = reverse(
-            "calendar:delete_posting_slot",
-            kwargs={"workspace_id": self.workspace_a.id, "slot_id": self.slot_a.id},
-        )
-        response = self.client.post(url)
+        response = self.client.delete(self._slot_url(self.workspace_a, self.slot_a.id))
         self.assertEqual(response.status_code, 200)
         self.assertFalse(PostingSlot.objects.filter(id=self.slot_a.id).exists())
 
     def test_delete_slot_belonging_to_different_workspace_is_noop(self):
         """A slot outside the caller's workspace must never be deleted.
 
-        The workspace-scoped query finds nothing, so the endpoint is a uniform
+        The workspace-scoped query finds nothing, so the route is a uniform
         no-op: it never mutates and never 404-leaks the foreign slot's existence.
         """
         slot_a2 = PostingSlot.objects.create(
@@ -144,11 +140,7 @@ class PostingSlotCrossWorkspaceTests(TestCase):
         self.client.force_login(self.user_b)
         # User B uses their OWN workspace_id in the URL (auth passes), but the
         # slot_id is from workspace A — the scoped query never finds it.
-        url = reverse(
-            "calendar:delete_posting_slot",
-            kwargs={"workspace_id": self.workspace_b.id, "slot_id": slot_a2.id},
-        )
-        response = self.client.post(url)
+        response = self.client.delete(self._slot_url(self.workspace_b, slot_a2.id))
         self.assertEqual(response.status_code, 200)
         # Load-bearing invariant (not the 200 status): the foreign slot is untouched.
         self.assertTrue(PostingSlot.objects.filter(id=slot_a2.id).exists())
@@ -161,68 +153,23 @@ class PostingSlotCrossWorkspaceTests(TestCase):
             time=time(11, 0),
         )
         self.client.force_login(self.user_b)
-        url = reverse(
-            "calendar:update_posting_slot",
-            kwargs={"workspace_id": self.workspace_b.id, "slot_id": slot_a2.id},
+        response = self.client.patch(
+            self._slot_url(self.workspace_b, slot_a2.id), data='{"time": "13:30"}', content_type="application/json"
         )
-        response = self.client.post(url, data={"time": "13:30"})
-        self.assertEqual(response.status_code, 200)
-        # Load-bearing invariant (not the 200 status): the foreign slot is unchanged.
+        self.assertEqual(response.status_code, 404)
+        # Load-bearing invariant (not the status): the foreign slot is unchanged.
         slot_a2.refresh_from_db()
         self.assertEqual(slot_a2.time, time(11, 0))
 
-    def test_delete_already_gone_slot_is_idempotent_self_heal(self):
-        """Re-deleting an own-workspace slot that is already gone refreshes the
-        grid (HX-Trigger) instead of 404ing — the stale-page / double-click fix.
+    def test_delete_already_gone_slot_is_idempotent(self):
+        """Re-deleting an own-workspace slot that is already gone (stale page,
+        double-click) succeeds instead of erroring.
         """
-        url = reverse(
-            "calendar:delete_posting_slot",
-            kwargs={"workspace_id": self.workspace_a.id, "slot_id": self.slot_a.id},
-        )
+        url = self._slot_url(self.workspace_a, self.slot_a.id)
         self.client.force_login(self.user_a)
-        first = self.client.post(url, HTTP_HX_REQUEST="true")
-        self.assertEqual(first.status_code, 204)
-        self.assertIn("slotsUpdated", first.headers.get("HX-Trigger", ""))
+        self.assertEqual(self.client.delete(url).status_code, 200)
         self.assertFalse(PostingSlot.objects.filter(id=self.slot_a.id).exists())
-        # Second delete of the now-missing slot must NOT 404; with the posted
-        # account id it still emits the grid-refresh trigger so the stale row clears.
-        second = self.client.post(url, data={"social_account_id": str(self.account_a.id)}, HTTP_HX_REQUEST="true")
-        self.assertEqual(second.status_code, 204)
-        self.assertIn(str(self.account_a.id), second.headers.get("HX-Trigger", ""))
-
-    def test_delete_real_slot_emits_account_scoped_trigger(self):
-        """The happy-path HX-Trigger carries the account id under ``detail`` so the
-        grid's ``slotsUpdated[detail.accountId==...]`` filter matches and refreshes.
-        """
-        import json
-
-        url = reverse(
-            "calendar:delete_posting_slot",
-            kwargs={"workspace_id": self.workspace_a.id, "slot_id": self.slot_a.id},
-        )
-        self.client.force_login(self.user_a)
-        resp = self.client.post(url, HTTP_HX_REQUEST="true")
-        self.assertEqual(resp.status_code, 204)
-        payload = json.loads(resp.headers["HX-Trigger"])
-        self.assertEqual(payload["slotsUpdated"]["accountId"], str(self.account_a.id))
-
-    def test_update_already_gone_slot_is_idempotent_self_heal(self):
-        """Editing the time of an own-workspace slot that is already gone refreshes
-        the grid (HX-Trigger) instead of 404ing — mirrors the delete self-heal.
-        """
-        url = reverse(
-            "calendar:update_posting_slot",
-            kwargs={"workspace_id": self.workspace_a.id, "slot_id": self.slot_a.id},
-        )
-        self.client.force_login(self.user_a)
-        self.slot_a.delete()
-        resp = self.client.post(
-            url,
-            data={"time": "08:15", "social_account_id": str(self.account_a.id)},
-            HTTP_HX_REQUEST="true",
-        )
-        self.assertEqual(resp.status_code, 204)
-        self.assertIn(str(self.account_a.id), resp.headers.get("HX-Trigger", ""))
+        self.assertEqual(self.client.delete(url).status_code, 200)
 
     def test_slot_mutation_denied_for_member_without_manage_permission(self):
         """A workspace member whose role lacks manage_social_accounts cannot mutate
@@ -244,11 +191,7 @@ class PostingSlotCrossWorkspaceTests(TestCase):
             workspace_role=WorkspaceMembership.WorkspaceRole.VIEWER,
         )
         self.client.force_login(viewer)
-        url = reverse(
-            "calendar:delete_posting_slot",
-            kwargs={"workspace_id": self.workspace_a.id, "slot_id": self.slot_a.id},
-        )
-        response = self.client.post(url)
+        response = self.client.delete(self._slot_url(self.workspace_a, self.slot_a.id))
         self.assertEqual(response.status_code, 403)
         # The slot must survive an unauthorized delete attempt.
         self.assertTrue(PostingSlot.objects.filter(id=self.slot_a.id).exists())
@@ -595,12 +538,17 @@ class RepairPublishedScheduledAtTests(TestCase):
 
 
 class CalendarChannelSlotViewTests(TestCase):
-    """Day/week calendar data should expose channel posting slots."""
+    """The calendar window exposes channel posting slots, minus the ones a chip already fills."""
 
     def setUp(self):
-        self.factory = RequestFactory()
         self.org = Organization.objects.create(name="Calendar Slots Org", default_timezone="America/New_York")
         self.workspace = Workspace.objects.create(organization=self.org, name="Calendar Slots WS")
+        self.user = User.objects.create_user(email="slots@example.com", password="pw", tos_accepted_at=timezone.now())
+        OrgMembership.objects.create(user=self.user, organization=self.org, org_role=OrgMembership.OrgRole.OWNER)
+        WorkspaceMembership.objects.create(
+            user=self.user, workspace=self.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
+        )
+        self.client.force_login(self.user)
         self.account = SocialAccount.objects.create(
             workspace=self.workspace,
             platform="instagram",
@@ -616,6 +564,12 @@ class CalendarChannelSlotViewTests(TestCase):
             connection_status=SocialAccount.ConnectionStatus.CONNECTED,
         )
 
+    def _day(self, target, tz, **params):
+        query = {"start": target.isoformat(), "end": target.isoformat(), "tz": tz, **params}
+        response = self.client.get(f"/api/web/workspaces/{self.workspace.id}/calendar", query)
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
     def test_day_view_marks_exact_channel_slot_taken(self):
         target = date(2026, 6, 15)  # Monday
         ny = zoneinfo.ZoneInfo("America/New_York")
@@ -629,40 +583,27 @@ class CalendarChannelSlotViewTests(TestCase):
             scheduled_at=scheduled_at,
         )
 
-        context = {"display_timezone": "America/New_York"}
-        _day_view_data(self.factory.get("/"), self.workspace, target, context)
+        body = self._day(target, "America/New_York")
 
-        cells = {cell["hour"]: cell for cell in context["day_slots"]}
-        hour_posts = cells[9]["posts"]
-        slot_items = cells[9]["slots"]
-        self.assertEqual(slot_items, [])
-        self.assertEqual(len(hour_posts), 1)
-        self.assertTrue(hour_posts[0].takes_calendar_slot)
+        self.assertEqual(body["open_slots"], [])
+        self.assertEqual([c["account"]["id"] for c in body["chips"]], [str(self.account.id)])
 
     def test_day_view_channel_filter_limits_slot_badges(self):
         target = date(2026, 6, 15)  # Monday
         PostingSlot.objects.create(social_account=self.account, day_of_week=0, time=time(9, 0))
         PostingSlot.objects.create(social_account=self.other_account, day_of_week=0, time=time(9, 0))
 
-        request = self.factory.get("/", {"channel": str(self.account.id)})
-        context = {"display_timezone": "America/New_York"}
-        _day_view_data(request, self.workspace, target, context)
+        body = self._day(target, "America/New_York", channel=str(self.account.id))
 
-        cells = {cell["hour"]: cell for cell in context["day_slots"]}
-        slot_items = cells[9]["slots"]
-        self.assertEqual([slot["account"] for slot in slot_items], [self.account])
+        self.assertEqual([s["account"]["id"] for s in body["open_slots"]], [str(self.account.id)])
 
     def test_day_view_ignores_malformed_channel_filter(self):
         target = date(2026, 6, 15)  # Monday
         PostingSlot.objects.create(social_account=self.account, day_of_week=0, time=time(9, 0))
 
-        request = self.factory.get("/", {"channel": "not-a-uuid"})
-        context = {"display_timezone": "America/New_York"}
-        _day_view_data(request, self.workspace, target, context)
+        body = self._day(target, "America/New_York", channel="not-a-uuid")
 
-        cells = {cell["hour"]: cell for cell in context["day_slots"]}
-        slot_items = cells[9]["slots"]
-        self.assertEqual([slot["account"] for slot in slot_items], [self.account])
+        self.assertEqual([s["account"]["id"] for s in body["open_slots"]], [str(self.account.id)])
 
     def test_day_view_includes_workspace_slot_from_adjacent_display_date(self):
         self.workspace.timezone = "America/Los_Angeles"
@@ -679,15 +620,13 @@ class CalendarChannelSlotViewTests(TestCase):
             scheduled_at=scheduled_at,
         )
 
-        context = {"display_timezone": "Asia/Tokyo"}
-        _day_view_data(self.factory.get("/"), self.workspace, target, context)
+        body = self._day(target, "Asia/Tokyo")
 
-        cells = {cell["hour"]: cell for cell in context["day_slots"]}
-        hour_posts = cells[1]["posts"]
-        slot_items = cells[1]["slots"]
-        self.assertEqual(slot_items, [])
-        self.assertEqual(len(hour_posts), 1)
-        self.assertTrue(hour_posts[0].takes_calendar_slot)
+        # Monday 09:00 LA is Tuesday 01:00 Tokyo: the slot lands on the target
+        # day and the chip sitting on it takes it.
+        self.assertEqual(body["open_slots"], [])
+        self.assertEqual(len(body["chips"]), 1)
+        self.assertEqual(datetime.fromisoformat(body["chips"][0]["at"]), scheduled_at)
 
 
 class RecurringPostTimezoneTests(TestCase):
@@ -831,7 +770,7 @@ class RecurringPostPlatformExtraTests(TestCase):
 
 
 class PublishTabTimezoneTests(TestCase):
-    """The publish tabs must render times in a user-supplied ?tz= without 500ing."""
+    """The calendar window must honour a user-supplied ?tz= without 500ing."""
 
     def setUp(self):
         self.user = User.objects.create_user(email="tz@example.com", password="pw", tos_accepted_at=timezone.now())
@@ -841,41 +780,26 @@ class PublishTabTimezoneTests(TestCase):
         WorkspaceMembership.objects.create(
             user=self.user, workspace=self.ws, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
         )
-        self.sa = SocialAccount.objects.create(
-            workspace=self.ws,
-            platform="linkedin_personal",
-            account_platform_id="li-tz",
-            account_name="A",
-            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
-        )
-        self.post = Post.objects.create(
-            workspace=self.ws,
-            author=self.user,
-            caption="x",
-            proposed_publish_at=datetime(2027, 9, 1, 9, 0, tzinfo=zoneinfo.ZoneInfo("Europe/Berlin")),
-        )
-        PlatformPost.objects.create(post=self.post, social_account=self.sa, status="draft")
         self.client.force_login(self.user)
+        self.url = f"/api/web/workspaces/{self.ws.id}/calendar"
 
     def test_coerce_timezone_falls_back_on_bad_input(self):
-        from apps.calendar.views import _coerce_timezone
+        from apps.webapi.routers.calendar import _tz
 
-        self.assertEqual(_coerce_timezone("Europe/Berlin", None), "Europe/Berlin")
-        self.assertEqual(_coerce_timezone("Not/AZone", "Europe/Berlin"), "Europe/Berlin")
-        self.assertEqual(_coerce_timezone("", None), "UTC")
-        self.assertEqual(_coerce_timezone(None, None), "UTC")
-        self.assertEqual(_coerce_timezone("garbage", "also-bad"), "UTC")
+        self.assertEqual(_tz("Europe/Berlin", None), "Europe/Berlin")
+        self.assertEqual(_tz("Not/AZone", "Europe/Berlin"), "Europe/Berlin")
+        self.assertEqual(_tz("", None), "UTC")
+        self.assertEqual(_tz(None, None), "UTC")
+        self.assertEqual(_tz("garbage", "also-bad"), "UTC")
 
-    def test_drafts_tab_with_invalid_tz_does_not_500(self):
-        url = reverse("calendar:publish_tab_drafts", kwargs={"workspace_id": self.ws.id})
-        resp = self.client.get(url + "?tz=Not/AReal/Zone")
+    def test_window_with_invalid_tz_does_not_500(self):
+        resp = self.client.get(self.url + "?tz=Not/AReal/Zone")
         self.assertEqual(resp.status_code, 200)
-        # Falls back to the workspace zone, so the proposed badge still renders.
-        self.assertContains(resp, "Proposed")
+        # Falls back to the workspace zone.
+        self.assertEqual(resp.json()["display_timezone"], "Europe/Berlin")
 
-    def test_drafts_tab_with_empty_tz_does_not_500(self):
-        url = reverse("calendar:publish_tab_drafts", kwargs={"workspace_id": self.ws.id})
-        resp = self.client.get(url + "?tz=")
+    def test_window_with_empty_tz_does_not_500(self):
+        resp = self.client.get(self.url + "?tz=")
         self.assertEqual(resp.status_code, 200)
 
 
@@ -1170,7 +1094,7 @@ class SlotOccupancyQueueTests(TestCase):
 
 
 class QueueEntryEndpointTests(TestCase):
-    """HTTP endpoints for single-entry remove / reslot (workspace-scoped)."""
+    """Web API routes for single-entry remove / reslot (workspace-scoped)."""
 
     def setUp(self):
         self.user = User.objects.create_user(email="qe@example.com", password="pw", tos_accepted_at=timezone.now())
@@ -1200,18 +1124,15 @@ class QueueEntryEndpointTests(TestCase):
         entry = QueueEntry.objects.create(queue=self.queue, post=post, position=0, assigned_slot_datetime=slot_dt)
         return post, entry
 
-    def _remove_url(self, entry_id, queue_id=None):
-        return reverse(
-            "calendar:queue_entry_remove",
-            kwargs={"workspace_id": self.workspace.id, "queue_id": queue_id or self.queue.id, "entry_id": entry_id},
-        )
+    def _entry_url(self, entry_id, queue_id=None):
+        return f"/api/web/workspaces/{self.workspace.id}/calendar/queues/{queue_id or self.queue.id}/entries/{entry_id}"
 
     def test_remove_entry_deletes_and_drafts(self):
         c = _next_slot_datetimes(self.account, timezone.now(), count=2)
         post, entry = self._queue_post(c[0])
-        resp = self.client.post(self._remove_url(entry.id), HTTP_HX_REQUEST="true")
-        self.assertEqual(resp.status_code, 204)
-        self.assertIn("queueReordered", resp.headers.get("HX-Trigger", ""))
+        resp = self.client.delete(self._entry_url(entry.id))
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["removed"])
         self.assertFalse(QueueEntry.objects.filter(id=entry.id).exists())
         pp = PlatformPost.objects.get(post=post)
         self.assertEqual(pp.status, PlatformPost.Status.DRAFT)
@@ -1220,8 +1141,9 @@ class QueueEntryEndpointTests(TestCase):
     def test_remove_idempotent_when_already_gone(self):
         import uuid as _uuid
 
-        resp = self.client.post(self._remove_url(_uuid.uuid4()), HTTP_HX_REQUEST="true")
-        self.assertEqual(resp.status_code, 204)
+        resp = self.client.delete(self._entry_url(_uuid.uuid4()))
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["removed"])
 
     def test_remove_foreign_workspace_entry_is_noop(self):
         other_org = Organization.objects.create(name="Other")
@@ -1238,25 +1160,20 @@ class QueueEntryEndpointTests(TestCase):
         other_entry = QueueEntry.objects.create(queue=other_queue, post=other_post, position=0)
 
         # Member of self.workspace targets their own workspace_id but a foreign entry.
-        resp = self.client.post(self._remove_url(other_entry.id, queue_id=other_queue.id), HTTP_HX_REQUEST="true")
-        self.assertEqual(resp.status_code, 204)
+        resp = self.client.delete(self._entry_url(other_entry.id, queue_id=other_queue.id))
+        self.assertEqual(resp.status_code, 200)
         self.assertTrue(QueueEntry.objects.filter(id=other_entry.id).exists())
 
     def test_reslot_moves_to_next_gap(self):
         c = _next_slot_datetimes(self.account, timezone.now(), count=3)
         post, entry = self._queue_post(c[2])  # [0],[1] free
-        url = reverse(
-            "calendar:queue_entry_reslot",
-            kwargs={"workspace_id": self.workspace.id, "queue_id": self.queue.id, "entry_id": entry.id},
-        )
-        resp = self.client.post(url, HTTP_HX_REQUEST="true")
-        self.assertEqual(resp.status_code, 204)
+        resp = self.client.post(self._entry_url(entry.id) + "/reslot")
+        self.assertEqual(resp.status_code, 200)
         pp = PlatformPost.objects.get(post=post)
         self.assertEqual(pp.scheduled_at, c[0])
 
-    def test_queue_detail_page_renders_chronologically(self):
-        # Smoke: the detail page renders with the new remove button and orders
-        # entries by slot datetime (an earlier slot added second still shows first).
+    def test_queue_detail_lists_entries_chronologically(self):
+        # Entries are ordered by slot datetime (an earlier slot added second still comes first).
         c = _next_slot_datetimes(self.account, timezone.now(), count=2)
         later = Post.objects.create(workspace=self.workspace, caption="LATER caption")
         PlatformPost.objects.create(
@@ -1269,9 +1186,6 @@ class QueueEntryEndpointTests(TestCase):
         )
         QueueEntry.objects.create(queue=self.queue, post=earlier, position=1, assigned_slot_datetime=c[0])
 
-        url = reverse("calendar:queue_detail", kwargs={"workspace_id": self.workspace.id, "queue_id": self.queue.id})
-        resp = self.client.get(url)
+        resp = self.client.get(f"/api/web/workspaces/{self.workspace.id}/calendar/queues/{self.queue.id}")
         self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, "Remove from queue")
-        body = resp.content.decode()
-        self.assertLess(body.index("EARLIER caption"), body.index("LATER caption"))
+        self.assertEqual([e["caption"] for e in resp.json()["entries"]], ["EARLIER caption", "LATER caption"])
