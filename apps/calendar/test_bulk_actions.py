@@ -1,18 +1,19 @@
 """Tests for the Publish page's bulk selection bar and drag-and-drop reschedule.
 
-Both endpoints promote rows into ``scheduled``, which hands them to the
-publisher's poll loop — the privilege ``publish_directly`` gates on every other
-scheduling surface (the composer's chip transition, ``save_post``'s publish-now
-branch, REST ``/schedule``). These tests pin that gate plus the protected-status
-skips and the orphan-Post cleanup.
+Both web API routes (``/api/web/workspaces/<ws>/calendar/bulk`` and
+``.../calendar/reschedule``) promote rows into ``scheduled``, which hands them
+to the publisher's poll loop — the privilege ``publish_directly`` gates on every
+other scheduling surface (the composer's chip transition, ``save_post``'s
+publish-now branch, REST ``/schedule``). These tests pin that gate plus the
+protected-status skips and the orphan-Post cleanup.
 """
 
+import json
 import zoneinfo
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import patch
 
 from django.test import TestCase
-from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
@@ -98,11 +99,17 @@ class BulkActionBase(TestCase):
             scheduled_at=scheduled_at,
         )
 
+    def _api(self, path, payload=None):
+        url = f"/api/web/workspaces/{self.workspace.id}/calendar{path}"
+        if payload is None:
+            return self.client.get(url)
+        return self.client.post(url, data=json.dumps(payload), content_type="application/json")
+
     def _bulk(self, action, *pps):
-        return self.client.post(
-            reverse("calendar:bulk_platform_action", kwargs={"workspace_id": self.workspace.id}),
-            data={"action": action, "platform_post_ids": [str(pp.id) for pp in pps]},
-        )
+        return self._api("/bulk", {"action": action, "platform_post_ids": [str(pp.id) for pp in pps]})
+
+    def _reschedule(self, pp, when):
+        return self._api("/reschedule", {"platform_post_id": str(pp.id), "new_local": when.strftime("%Y-%m-%dT%H:%M")})
 
 
 class BulkPlatformActionPermissionTests(BulkActionBase):
@@ -294,15 +301,9 @@ class BulkPlatformActionFailedRowTests(BulkActionBase):
         pp.retry_count = 2
         pp.save(update_fields=["publish_error", "retry_count"])
 
-        response = self.client.post(
-            reverse("calendar:reschedule", kwargs={"workspace_id": self.workspace.id}),
-            data={
-                "platform_post_id": str(pp.id),
-                "new_datetime": (timezone.now() + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S"),
-            },
-        )
+        response = self._reschedule(pp, timezone.now() + timedelta(days=2))
 
-        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.status_code, 200)
         pp.refresh_from_db()
         self.assertEqual(pp.status, "scheduled")
         self.assertEqual(pp.publish_error, "")
@@ -407,12 +408,20 @@ class BulkPublishStaggerTests(BulkActionBase):
         self.assertEqual(a.scheduled_at, b.scheduled_at)
 
 
-class PublishTabCountTests(BulkActionBase):
-    """Badge counts must agree with the filtered list they sit above."""
+class CalendarWindowCountTests(BulkActionBase):
+    """The window's chips must agree with the channel filter the badge sits above."""
 
     def setUp(self):
         super().setUp()
         self.client.force_login(self.owner)
+
+    def _window(self, **params):
+        today = timezone.now().date()
+        query = {"start": (today - timedelta(days=1)).isoformat(), "end": (today + timedelta(days=3)).isoformat()}
+        query.update(params)
+        response = self.client.get(f"/api/web/workspaces/{self.workspace.id}/calendar", query)
+        self.assertEqual(response.status_code, 200)
+        return response.json()
 
     def test_queue_count_respects_the_channel_filter(self):
         soon = timezone.now() + timedelta(days=1)
@@ -420,26 +429,16 @@ class PublishTabCountTests(BulkActionBase):
         self._pp("scheduled", scheduled_at=soon)
         self._pp("scheduled", scheduled_at=soon, account=self.other_account)
 
-        response = self.client.get(
-            reverse("calendar:publish_tab_queue", kwargs={"workspace_id": self.workspace.id}),
-            {"channel": str(self.other_account.id)},
-            HTTP_HX_REQUEST="true",
-        )
+        body = self._window(status="scheduled", channel=str(self.other_account.id))
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.context["queue_count"], 1)
+        self.assertEqual(len(body["chips"]), 1)
 
     def test_unfiltered_queue_count_sees_everything(self):
         soon = timezone.now() + timedelta(days=1)
         self._pp("scheduled", scheduled_at=soon)
         self._pp("scheduled", scheduled_at=soon, account=self.other_account)
 
-        response = self.client.get(
-            reverse("calendar:publish_tab_queue", kwargs={"workspace_id": self.workspace.id}),
-            HTTP_HX_REQUEST="true",
-        )
-
-        self.assertEqual(response.context["queue_count"], 2)
+        self.assertEqual(len(self._window(status="scheduled")["chips"]), 2)
 
 
 class TodayInViewTimezoneTests(BulkActionBase):
@@ -452,25 +451,20 @@ class TodayInViewTimezoneTests(BulkActionBase):
     def test_today_is_read_in_the_display_timezone(self):
         """At 22:00 UTC it is already tomorrow in Tokyo.
 
-        The grids compute `today` as now-in-display-tz; the toolbar must use the
-        same clock or the button disables on the wrong day for hours at a time.
+        The grids highlight `today` as now-in-display-tz; the API must hand the
+        toolbar the same clock or the button disables on the wrong day for hours.
         """
         tokyo = zoneinfo.ZoneInfo("Asia/Tokyo")
         fixed = datetime(2026, 8, 7, 22, 0, tzinfo=UTC)
-        tokyo_today = fixed.astimezone(tokyo).date()
-        self.assertEqual(tokyo_today, date(2026, 8, 8))  # guards the premise
+        self.assertEqual(fixed.astimezone(tokyo).date(), date(2026, 8, 8))  # guards the premise
 
-        url = reverse("calendar:calendar", kwargs={"workspace_id": self.workspace.id})
+        url = f"/api/web/workspaces/{self.workspace.id}/calendar"
         with patch("django.utils.timezone.now", return_value=fixed):
-            response = self.client.get(
-                url, {"mode": "calendar", "view": "day", "date": "2026-08-08", "tz": "Asia/Tokyo"}
-            )
-            self.assertTrue(response.context["is_today_in_view"])
+            response = self.client.get(url, {"start": "2026-08-08", "end": "2026-08-08", "tz": "Asia/Tokyo"})
+            self.assertEqual(response.json()["today"], "2026-08-08")
 
-            response = self.client.get(
-                url, {"mode": "calendar", "view": "day", "date": "2026-08-07", "tz": "Asia/Tokyo"}
-            )
-            self.assertFalse(response.context["is_today_in_view"])
+            response = self.client.get(url, {"start": "2026-08-07", "end": "2026-08-07", "tz": "UTC"})
+            self.assertEqual(response.json()["today"], "2026-08-07")
 
 
 class InvalidTimezoneTests(BulkActionBase):
@@ -479,72 +473,26 @@ class InvalidTimezoneTests(BulkActionBase):
     def setUp(self):
         super().setUp()
         self.client.force_login(self.owner)
+        self.url = f"/api/web/workspaces/{self.workspace.id}/calendar"
 
-    def test_list_mode_survives_a_bogus_timezone(self):
-        url = reverse("calendar:calendar", kwargs={"workspace_id": self.workspace.id})
-
-        response = self.client.get(url, {"mode": "list", "tab": "queue", "tz": "Not/AZone"})
+    def test_window_survives_a_bogus_timezone(self):
+        response = self.client.get(self.url, {"tz": "Not/AZone"})
 
         self.assertEqual(response.status_code, 200)
         # Coerced at the source, so every consumer downstream gets a real zone.
-        self.assertEqual(response.context["display_timezone"], "UTC")
+        self.assertEqual(response.json()["display_timezone"], self.workspace.effective_timezone)
 
-    def test_calendar_mode_survives_a_bogus_timezone(self):
-        url = reverse("calendar:calendar", kwargs={"workspace_id": self.workspace.id})
-
-        for view in ("month", "week", "day"):
-            with self.subTest(view=view):
-                response = self.client.get(url, {"mode": "calendar", "view": view, "tz": "Not/AZone"})
-                self.assertEqual(response.status_code, 200)
+    def test_window_survives_an_empty_timezone(self):
+        self.assertEqual(self.client.get(self.url, {"tz": ""}).status_code, 200)
 
     def test_a_real_timezone_is_still_honoured(self):
-        url = reverse("calendar:calendar", kwargs={"workspace_id": self.workspace.id})
+        response = self.client.get(self.url, {"tz": "Asia/Tokyo"})
 
-        response = self.client.get(url, {"mode": "list", "tab": "queue", "tz": "Asia/Tokyo"})
-
-        self.assertEqual(response.context["display_timezone"], "Asia/Tokyo")
-
-
-class SentTabCheckboxTests(BulkActionBase):
-    """The Sent tab mixes ``published`` (protected) and ``failed`` rows."""
-
-    def setUp(self):
-        super().setUp()
-        self.client.force_login(self.owner)
-
-    def _sent_html(self):
-        response = self.client.get(
-            reverse("calendar:publish_tab_sent", kwargs={"workspace_id": self.workspace.id}),
-            HTTP_HX_REQUEST="true",
-        )
-        self.assertEqual(response.status_code, 200)
-        return response.content.decode()
-
-    def test_published_row_has_no_checkbox(self):
-        pp = self._pp("published")
-        html = self._sent_html()
-
-        # The row is listed...
-        self.assertIn(str(pp.post_id), html)
-        # ...but every bulk action skips protected rows, so a checkbox here
-        # could only ever be a no-op.
-        self.assertNotIn(f"$store.sel.toggle('{pp.id}')", html)
-
-    def test_failed_row_keeps_its_checkbox(self):
-        pp = self._pp("failed")
-
-        # `failed` is not protected — bulk retry (publish) and delete both work.
-        self.assertIn(f"$store.sel.toggle('{pp.id}')", self._sent_html())
+        self.assertEqual(response.json()["display_timezone"], "Asia/Tokyo")
 
 
 class ReschedulePermissionTests(BulkActionBase):
     """Drag-and-drop promotes draft/failed chips to ``scheduled``."""
-
-    def _reschedule(self, pp, when):
-        return self.client.post(
-            reverse("calendar:reschedule", kwargs={"workspace_id": self.workspace.id}),
-            data={"platform_post_id": str(pp.id), "new_datetime": when.strftime("%Y-%m-%dT%H:%M:%S")},
-        )
 
     def test_editor_cannot_drag_a_draft_chip(self):
         pp = self._pp("draft")
@@ -574,7 +522,7 @@ class ReschedulePermissionTests(BulkActionBase):
 
         response = self._reschedule(pp, timezone.now() + timedelta(days=4))
 
-        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.status_code, 200)
         pp.refresh_from_db()
         self.assertEqual(pp.status, "approved")
         self.assertGreater(pp.scheduled_at, timezone.now() + timedelta(days=3))
@@ -585,7 +533,7 @@ class ReschedulePermissionTests(BulkActionBase):
 
         response = self._reschedule(pp, timezone.now() + timedelta(days=2))
 
-        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.status_code, 200)
         pp.refresh_from_db()
         self.assertEqual(pp.status, "scheduled")
         self.assertGreater(pp.scheduled_at, timezone.now() + timedelta(days=1))
