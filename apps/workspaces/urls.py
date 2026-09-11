@@ -1,12 +1,11 @@
 from django.urls import path
 
-from . import views
+from apps.common.console import console
 
 app_name = "workspaces"
 
 urlpatterns = [
-    path("", views.workspace_list, name="list"),
-    path("create/", views.workspace_create, name="create"),
-    path("<uuid:workspace_id>/settings/", views.workspace_settings, name="settings"),
-    path("<uuid:workspace_id>/settings/approvals/", views.approvals_settings, name="approvals_settings"),
+    path("", console("/org/workspaces"), name="list"),
+    path("<uuid:workspace_id>/settings/", console("/w/{workspace_id}/settings"), name="settings"),
+    path("<uuid:workspace_id>/settings/approvals/", console("/w/{workspace_id}/settings"), name="approvals_settings"),
 ]

@@ -418,34 +418,30 @@ class TestMcpBatchRateLimit:
 
 @pytest.mark.django_db
 class TestMalformedUuidHandling:
-    def test_workspace_options_partial_handles_bad_uuid(self, client, user):
-        """Codex P6 regression: Django UUIDField raises ``ValidationError``,
-        not ``ValueError``, so the previous narrower catch let bad UUIDs
-        bubble up as 500. Now the cascade returns the empty body it would
-        return for a missing/foreign workspace.
+    def test_workspace_options_handles_bad_uuid(self, client, user):
+        """Codex P6 regression: a malformed ``workspace_id`` must be a clean
+        validation error (422 from the web API), never a 500.
         """
         client.force_login(user)
-        r = client.get(
-            "/organizations/api-keys/_workspace-options/",
-            {"workspace_id": "not-a-uuid"},
-        )
-        assert r.status_code == 200
-        assert r.content == b""
+        r = client.get("/api/web/org/api-keys/options", {"workspace_id": "not-a-uuid"})
+        assert r.status_code == 422
 
     def test_issue_form_handles_bad_uuid(self, client, user):
         client.force_login(user)
         r = client.post(
-            "/organizations/api-keys/issue/",
-            {
-                "name": "bad-uuid",
-                "workspace_id": "not-a-uuid",
-                "social_account_ids": ["00000000-0000-0000-0000-000000000000"],
-            },
-            follow=True,
+            "/api/web/org/api-keys",
+            data=json.dumps(
+                {
+                    "name": "bad-uuid",
+                    "workspace_id": "not-a-uuid",
+                    "social_account_ids": ["00000000-0000-0000-0000-000000000000"],
+                    "permissions": [],
+                }
+            ),
+            content_type="application/json",
         )
-        # Redirects to list with an error message — not a 500.
-        assert r.status_code == 200
-        assert b"not in this organisation" in r.content
+        # Validation error — not a 500.
+        assert r.status_code == 422
 
 
 # ===========================================================================
