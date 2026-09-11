@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from django.test import SimpleTestCase
 
-from apps.composer.views import _validate_rss_url
+from apps.composer.feeds import validate_rss_url as _validate_rss_url
 
 _VALID_RSS = b"""<?xml version='1.0'?><rss version='2.0'><channel>
 <title>Sample</title><link>https://example.com</link></channel></rss>"""

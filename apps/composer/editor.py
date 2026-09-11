@@ -168,10 +168,10 @@ def normalize_platform_extra(platform: str, extra: dict[str, Any], existing: dic
 
 
 def _validate_pinterest_boards(post: Post | None, workspace, accounts: list[AccountInput]) -> None:
-    ids = [a.id for a in accounts]
+    by_id = {a.id: a for a in accounts if _is_uuid(a.id)}
+    ids = list(by_id)
     if not ids:
         return
-    by_id = {a.id: a for a in accounts}
     for account in SocialAccount.objects.filter(id__in=ids, workspace=workspace, platform="pinterest"):
         acc = by_id[str(account.id)]
         board = _clean((acc.extra or {}).get("board_id"))
@@ -339,8 +339,12 @@ def sync_tags_to_model(workspace, tag_names) -> None:
         Tag.objects.bulk_create(new, ignore_conflicts=True)
 
 
-def sync_media(post: Post, workspace, ordered_ids: list[str]) -> None:
-    """Make ``post.media_attachments`` match ``ordered_ids`` (workspace + shared assets only)."""
+def sync_media(post: Post, workspace, ordered_ids: list[str]) -> bool:
+    """Make ``post.media_attachments`` match ``ordered_ids`` (workspace + shared assets only).
+
+    Returns whether the attachment list changed (a media edit counts as a
+    content edit for the approved-content revert).
+    """
     from apps.media_library.models import MediaAsset
 
     wanted = []
@@ -356,7 +360,8 @@ def sync_media(post: Post, workspace, ordered_ids: list[str]) -> None:
         .values_list("id", flat=True)
     }
     wanted = [w for w in wanted if w in valid]
-    existing = {str(pm.media_asset_id): pm for pm in post.media_attachments.all()}
+    attachments = list(post.media_attachments.order_by("position"))
+    existing = {str(pm.media_asset_id): pm for pm in attachments}
     post.media_attachments.exclude(media_asset_id__in=wanted).delete()
     for position, asset_id in enumerate(wanted):
         pm = existing.get(asset_id)
@@ -365,6 +370,7 @@ def sync_media(post: Post, workspace, ordered_ids: list[str]) -> None:
         elif pm.position != position:
             pm.position = position
             pm.save(update_fields=["position"])
+    return [str(pm.media_asset_id) for pm in attachments] != wanted
 
 
 def resolve_queues(queue_id, workspace, account_ids: list[str]):
@@ -457,7 +463,7 @@ def _save_recurrence(post: Post, rec: dict[str, Any]) -> None:
 def _queue(post: Post, workspace, user, payload: EditorPayload, *, priority: bool) -> Post:
     from apps.calendar.services import QueueFullError, add_to_queue
 
-    queues = resolve_queues(payload.queue_id, workspace, [a.id for a in payload.accounts])
+    queues = resolve_queues(payload.queue_id, workspace, [a.id for a in payload.accounts if _is_uuid(a.id)])
     if not queues:
         raise EditorError("queue", "No active queue found for the selected channel.")
     post.proposed_publish_at = None
@@ -502,13 +508,12 @@ def autosave(post: Post | None, workspace, user, payload: EditorPayload) -> Post
     post.internal_notes = payload.internal_notes or ""
     post.tags = parse_and_truncate_tag_string(",".join(payload.tags or []))
     post.save()
-    if payload.media_asset_ids is not None:
-        sync_media(post, workspace, payload.media_asset_ids)
+    media_changed = payload.media_asset_ids is not None and sync_media(post, workspace, payload.media_asset_ids)
     selected = [a.id for a in payload.accounts if _is_uuid(a.id)]
     remove_deselected_platform_posts(post, selected, payload.account_scope)
     for acc_id in selected:
         PlatformPost.objects.get_or_create(post=post, social_account_id=acc_id)
-    if orig is not None and base_content_snapshot(post) != orig:
+    if media_changed or (orig is not None and base_content_snapshot(post) != orig):
         revert_approved_to_review(post)
     return post
 
@@ -571,8 +576,7 @@ def save(post: Post | None, workspace, user, perms: dict, payload: EditorPayload
         capture_proposed_publish_at(post, workspace, payload)
 
     post.save()
-    if payload.media_asset_ids is not None:
-        sync_media(post, workspace, payload.media_asset_ids)
+    media_changed = payload.media_asset_ids is not None and sync_media(post, workspace, payload.media_asset_ids)
     sync_tags_to_model(workspace, post.tags)
     if payload.recurring and action == "schedule" and post.scheduled_at:
         _save_recurrence(post, payload.recurring)
@@ -586,7 +590,7 @@ def save(post: Post | None, workspace, user, perms: dict, payload: EditorPayload
             qs = qs.filter(id__in=scoped_ids)
         qs.update(scheduled_at=propagate_dt)
 
-    content_changed = orig_content is not None and base_content_snapshot(post) != orig_content
+    content_changed = media_changed or (orig_content is not None and base_content_snapshot(post) != orig_content)
     reverted_ids = {str(pp.id) for pp in revert_approved_to_review(post)} if content_changed else set()
 
     if pending_target:

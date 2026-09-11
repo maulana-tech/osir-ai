@@ -1,7 +1,6 @@
-"""Tests for clone_post (Clone / Repost) — service + endpoint."""
+"""Tests for clone_post (Clone / Repost) — service + web API route."""
 
 from django.test import TestCase
-from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
@@ -92,19 +91,18 @@ class ClonePostEndpointTest(TestCase):
             published_at=timezone.now(),
         )
 
-    def test_clone_endpoint_creates_draft_and_redirects(self):
+    def _clone(self):
+        return self.client.post(f"/api/web/workspaces/{self.workspace.id}/composer/posts/{self.post.id}/clone")
+
+    def test_clone_endpoint_creates_draft(self):
         self.client.force_login(self.owner)
-        url = reverse("composer:clone_post", kwargs={"workspace_id": self.workspace.id, "post_id": self.post.id})
-        resp = self.client.post(url, HTTP_HX_REQUEST="true")
+        resp = self._clone()
 
-        self.assertEqual(resp.status_code, 204)
-        redirect_url = resp.headers.get("HX-Redirect", "")
-        self.assertIn("/compose/", redirect_url)
-
+        self.assertEqual(resp.status_code, 200)
         clone = Post.objects.exclude(id=self.post.id).get(workspace=self.workspace)
+        self.assertEqual(resp.json()["id"], str(clone.id))
         self.assertEqual(clone.caption, "published thing")
         self.assertEqual(clone.platform_posts.get().status, PlatformPost.Status.DRAFT)
-        self.assertIn(str(clone.id), redirect_url)
 
     def test_clone_endpoint_denies_member_without_create_posts(self):
         viewer = User.objects.create_user(email="viewer@example.com", password="pw", tos_accepted_at=timezone.now())
@@ -112,8 +110,7 @@ class ClonePostEndpointTest(TestCase):
             user=viewer, workspace=self.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.VIEWER
         )
         self.client.force_login(viewer)
-        url = reverse("composer:clone_post", kwargs={"workspace_id": self.workspace.id, "post_id": self.post.id})
-        resp = self.client.post(url, HTTP_HX_REQUEST="true")
+        resp = self._clone()
 
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(Post.objects.filter(workspace=self.workspace).count(), 1)
