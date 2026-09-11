@@ -13,7 +13,7 @@ import pytest
 from django.utils import timezone
 
 from apps.inbox.models import InboxMessage, InboxReply
-from apps.inbox.services import send_platform_reply
+from apps.inbox.services import reply_failure_reason, send_platform_reply, send_reply
 from apps.social_accounts.models import SocialAccount
 
 
@@ -101,73 +101,6 @@ def test_providers_without_a_comment_edge_alias_reply_to_comment():
         provider.reply_to_message.assert_called_once_with("token", "comment-1", "Thanks!", {"k": "v"})
 
 
-def test_a_provider_that_cannot_reply_records_the_reply_locally(client, fb_account, org_owner, user):
-    """Losing the platform call must not lose the team's written answer."""
-    from apps.members.models import WorkspaceMembership
-
-    WorkspaceMembership.objects.create(
-        user=user, workspace=fb_account.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
-    )
-    message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
-    client.force_login(user)
-
-    with patch("apps.inbox.services.send_platform_reply", side_effect=NotImplementedError):
-        response = client.post(
-            f"/workspace/{fb_account.workspace_id}/inbox/{message.id}/reply/",
-            {"body": "Noted internally"},
-        )
-
-    assert response.status_code == 200
-    assert "HX-Reply-Failed" not in response
-    reply = InboxReply.objects.get(inbox_message=message)
-    assert reply.platform_reply_id == ""
-
-
-def test_the_error_shown_to_users_carries_no_raw_api_text(client, fb_account, org_owner, user):
-    """Trace IDs and raw API JSON belong in the log, not on a teammate's screen."""
-    from apps.members.models import WorkspaceMembership
-    from providers.exceptions import APIError
-
-    WorkspaceMembership.objects.create(
-        user=user, workspace=fb_account.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
-    )
-    message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
-    client.force_login(user)
-
-    raw = 'Facebook API error 401: {"error":{"fbtrace_id":"AFC8u7xsP__NwLs"}}'
-    with patch("apps.inbox.services.send_platform_reply", side_effect=APIError(raw, platform="facebook")):
-        response = client.post(
-            f"/workspace/{fb_account.workspace_id}/inbox/{message.id}/reply/",
-            {"body": "This will fail"},
-        )
-
-    body = response.content.decode()
-    assert "Reply not sent" in body
-    assert "fbtrace_id" not in body
-    assert "401" not in body
-
-
-def test_an_expired_connection_gets_a_reconnect_hint(client, fb_account, org_owner, user):
-    from apps.members.models import WorkspaceMembership
-    from providers.exceptions import TokenExpiredError
-
-    WorkspaceMembership.objects.create(
-        user=user, workspace=fb_account.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
-    )
-    message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
-    client.force_login(user)
-
-    with patch(
-        "apps.inbox.services.send_platform_reply", side_effect=TokenExpiredError("expired", platform="facebook")
-    ):
-        response = client.post(
-            f"/workspace/{fb_account.workspace_id}/inbox/{message.id}/reply/",
-            {"body": "hi"},
-        )
-
-    assert "Reconnect the account" in response.content.decode()
-
-
 def test_recent_dm_replies_without_the_human_agent_tag(fb_account):
     message = _message(fb_account, message_type=InboxMessage.MessageType.DM, hours_ago=2)
     provider = _provider()
@@ -213,47 +146,60 @@ def test_existing_extra_recipient_is_not_overwritten(fb_account):
     assert provider.reply_to_message.call_args.kwargs["extra"]["recipient_id"] == "from-payload"
 
 
-def test_failed_send_records_no_reply(client, fb_account, org_owner, user):
-    """The thread must never show a reply the customer never received."""
-    from apps.members.models import WorkspaceMembership
+# --- send_reply: what gets recorded, and what the user is told ---------------
 
-    WorkspaceMembership.objects.create(
-        user=user, workspace=fb_account.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
-    )
+
+def test_successful_send_records_the_reply(fb_account, user):
     message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
-    client.force_login(user)
 
-    with patch("apps.inbox.services.send_platform_reply", side_effect=RuntimeError("Meta said no")):
-        response = client.post(
-            f"/workspace/{fb_account.workspace_id}/inbox/{message.id}/reply/",
-            {"body": "This will fail"},
-        )
+    with patch("apps.inbox.services.send_platform_reply", return_value="mid.sent"):
+        reply = send_reply(message, "Happy to help", author=user)
 
-    assert response.status_code == 200
-    assert response["HX-Reply-Failed"] == "1"
-    assert b"Reply not sent" in response.content
+    assert reply.platform_reply_id == "mid.sent"
+    assert InboxReply.objects.get(inbox_message=message) == reply
+    message.refresh_from_db()
+    assert message.status == InboxMessage.Status.OPEN
+
+
+def test_failed_send_records_no_reply(fb_account, user):
+    """The thread must never show a reply the customer never received."""
+    message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
+
+    with (
+        patch("apps.inbox.services.send_platform_reply", side_effect=RuntimeError("Meta said no")),
+        pytest.raises(RuntimeError),
+    ):
+        send_reply(message, "This will fail", author=user)
+
     assert InboxReply.objects.filter(inbox_message=message).count() == 0
     # Status is untouched, so the message stays in the queue to be answered.
     message.refresh_from_db()
     assert message.status == InboxMessage.Status.UNREAD
 
 
-def test_successful_send_records_the_reply(client, fb_account, org_owner, user):
-    from apps.members.models import WorkspaceMembership
-
-    WorkspaceMembership.objects.create(
-        user=user, workspace=fb_account.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
-    )
+def test_a_provider_that_cannot_reply_records_the_reply_locally(fb_account, user):
+    """Losing the platform call must not lose the team's written answer."""
     message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
-    client.force_login(user)
 
-    with patch("apps.inbox.services.send_platform_reply", return_value="mid.sent"):
-        response = client.post(
-            f"/workspace/{fb_account.workspace_id}/inbox/{message.id}/reply/",
-            {"body": "Happy to help"},
-        )
+    with patch("apps.inbox.services.send_platform_reply", side_effect=NotImplementedError):
+        reply = send_reply(message, "Noted internally", author=user)
 
-    assert response.status_code == 200
-    assert "HX-Reply-Failed" not in response
-    reply = InboxReply.objects.get(inbox_message=message)
-    assert reply.platform_reply_id == "mid.sent"
+    assert reply.platform_reply_id == ""
+
+
+def test_an_expired_connection_gets_a_reconnect_hint():
+    from providers.exceptions import TokenExpiredError
+
+    assert "Reconnect the account" in reply_failure_reason(TokenExpiredError("expired", platform="facebook"))
+
+
+def test_the_error_shown_to_users_carries_no_raw_api_text():
+    """Trace IDs and raw API JSON belong in the log, not on a teammate's screen."""
+    from providers.exceptions import APIError
+
+    raw = 'Facebook API error 401: {"error":{"fbtrace_id":"AFC8u7xsP__NwLs"}}'
+    reason = reply_failure_reason(APIError(raw, platform="facebook"))
+
+    assert reason
+    assert "fbtrace_id" not in reason
+    assert "401" not in reason

@@ -1,17 +1,24 @@
+"""URL names for approval actions, kept alive for ``reverse()``/``{% url %}``.
+
+The actions themselves live in the web API (``apps/webapi/routers/approvals.py``)
+and the Agent API; these names are still referenced by
+``templates/approvals/partials/_approval_row.html`` and the calendar's publish tab,
+so they redirect to the console's approvals page.
+"""
+
 from django.urls import path
 
-from . import views
+from apps.common.console import console
 
 app_name = "approvals"
 
+_approvals = console("/w/{workspace_id}/approvals")
+
 urlpatterns = [
-    path("approvals/<uuid:post_id>/approve/", views.approve, name="approve"),
-    path("approvals/<uuid:post_id>/request-changes/", views.request_changes_view, name="request_changes"),
-    path("approvals/<uuid:post_id>/reject/", views.reject, name="reject"),
-    path("approvals/<uuid:post_id>/resume/", views.resume, name="resume"),
-    path("approvals/bulk/", views.bulk_action, name="bulk_action"),
-    path("approvals/<uuid:post_id>/comments/", views.add_comment, name="add_comment"),
-    path("approvals/<uuid:post_id>/comments/<uuid:comment_id>/edit/", views.edit_comment, name="edit_comment"),
-    path("approvals/<uuid:post_id>/comments/<uuid:comment_id>/delete/", views.delete_comment, name="delete_comment"),
-    path("approvals/<uuid:post_id>/versions/", views.version_diff, name="version_diff"),
+    path("approvals/<uuid:post_id>/approve/", _approvals, name="approve"),
+    path("approvals/<uuid:post_id>/request-changes/", _approvals, name="request_changes"),
+    path("approvals/<uuid:post_id>/reject/", _approvals, name="reject"),
+    path("approvals/<uuid:post_id>/resume/", _approvals, name="resume"),
+    path("approvals/bulk/", _approvals, name="bulk_action"),
+    path("approvals/<uuid:post_id>/versions/", _approvals, name="version_diff"),
 ]

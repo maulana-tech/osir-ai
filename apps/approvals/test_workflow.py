@@ -1,11 +1,9 @@
-"""Workflow tests for the redesigned approval surface.
+"""Workflow tests for the approval services.
 
-Covers the unified action contract (204 + HX-Trigger toast/refresh), the no-op
-"Nothing to update" path, bulk-reject comment enforcement, and the on_hold
-(client hold) transitions including its exclusion from the publish path.
+Covers approve / no-op, the on_hold (client hold) transitions including its
+exclusion from the publish path, two-stage review, and re-review after edits.
+The HTTP contract lives in ``apps/webapi/tests/test_approvals.py``.
 """
-
-import json
 
 from django.test import TestCase
 from django.urls import reverse
@@ -52,69 +50,18 @@ class ApprovalWorkflowBase(TestCase):
         PlatformPost.objects.create(post=post, social_account=self.account, status=status)
         return post
 
-    def _triggers(self, response):
-        return json.loads(response.headers["HX-Trigger"])
 
-
-class ActionViewContractTests(ApprovalWorkflowBase):
-    def test_approve_returns_toast_and_refresh(self):
+class ApproveServiceTests(ApprovalWorkflowBase):
+    def test_approve_moves_to_approved(self):
         post = self._post("pending_review")
-        self.client.force_login(self.reviewer)
-        url = reverse("approvals:approve", kwargs={"workspace_id": self.ws.id, "post_id": post.id})
-        resp = self.client.post(url)
-        self.assertEqual(resp.status_code, 204)
-        trig = self._triggers(resp)
-        self.assertIn("showToast", trig)
-        self.assertIn("approvalAction", trig)
+        self.assertTrue(services.approve_post(post, self.reviewer, self.ws))
         self.assertEqual(post.platform_posts.get().status, "approved")
+        self.assertTrue(ApprovalAction.objects.filter(post=post, action="approved").exists())
 
-    def test_approve_noop_warns_without_refresh(self):
+    def test_approve_is_a_noop_when_already_actioned(self):
         post = self._post("approved")  # nothing to do
-        self.client.force_login(self.reviewer)
-        url = reverse("approvals:approve", kwargs={"workspace_id": self.ws.id, "post_id": post.id})
-        resp = self.client.post(url)
-        self.assertEqual(resp.status_code, 204)
-        trig = self._triggers(resp)
-        self.assertEqual(trig["showToast"]["tone"], "warn")
-        self.assertNotIn("approvalAction", trig)
-
-    def test_request_changes_requires_comment(self):
-        post = self._post("pending_review")
-        self.client.force_login(self.reviewer)
-        url = reverse("approvals:request_changes", kwargs={"workspace_id": self.ws.id, "post_id": post.id})
-        resp = self.client.post(url, data={"comment": ""})
-        self.assertEqual(resp.status_code, 204)
-        self.assertEqual(self._triggers(resp)["showToast"]["tone"], "error")
-        self.assertEqual(post.platform_posts.get().status, "pending_review")
-
-    def test_request_changes_with_comment(self):
-        post = self._post("pending_review")
-        self.client.force_login(self.reviewer)
-        url = reverse("approvals:request_changes", kwargs={"workspace_id": self.ws.id, "post_id": post.id})
-        resp = self.client.post(url, data={"comment": "Tighten the hook"})
-        self.assertEqual(resp.status_code, 204)
-        self.assertIn("approvalAction", self._triggers(resp))
-        self.assertEqual(post.platform_posts.get().status, "changes_requested")
-        self.assertTrue(ApprovalAction.objects.filter(post=post, action="changes_requested").exists())
-
-    def test_bulk_reject_requires_comment(self):
-        post = self._post("pending_review")
-        self.client.force_login(self.reviewer)
-        url = reverse("approvals:bulk_action", kwargs={"workspace_id": self.ws.id})
-        resp = self.client.post(url, data={"action": "reject", "post_ids": [str(post.id)]})
-        self.assertEqual(resp.status_code, 204)
-        self.assertEqual(self._triggers(resp)["showToast"]["tone"], "error")
-        self.assertEqual(post.platform_posts.get().status, "pending_review")
-
-    def test_bulk_approve(self):
-        p1, p2 = self._post("pending_review"), self._post("pending_review")
-        self.client.force_login(self.reviewer)
-        url = reverse("approvals:bulk_action", kwargs={"workspace_id": self.ws.id})
-        resp = self.client.post(url, data={"action": "approve", "post_ids": [str(p1.id), str(p2.id)]})
-        self.assertEqual(resp.status_code, 204)
-        self.assertIn("bulkActionComplete", self._triggers(resp))
-        self.assertEqual(p1.platform_posts.get().status, "approved")
-        self.assertEqual(p2.platform_posts.get().status, "approved")
+        self.assertFalse(services.approve_post(post, self.reviewer, self.ws))
+        self.assertEqual(post.platform_posts.get().status, "approved")
 
 
 class HoldTests(ApprovalWorkflowBase):
@@ -361,72 +308,6 @@ class ApprovedEditReReviewTests(ApprovalWorkflowBase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.post.platform_posts.get().status, "pending_review")
-
-    def _image_asset(self):
-        from django.core.files.base import ContentFile
-
-        from apps.media_library.models import MediaAsset
-
-        return MediaAsset.objects.create(
-            organization=self.org,
-            workspace=self.ws,
-            file=ContentFile(b"x", name="pic.png"),
-            filename="pic.png",
-            media_type=MediaAsset.MediaType.IMAGE,
-        )
-
-    def test_attaching_media_reverts_approved(self):
-        asset = self._image_asset()
-        url = reverse("composer:attach_media", kwargs={"workspace_id": self.ws.id, "post_id": self.post.id})
-        resp = self.client.post(url, data={"media_asset_id": str(asset.id)})
-        self.assertIn(resp.status_code, (200, 204))
-        self.assertEqual(self.post.platform_posts.get().status, "pending_review")
-
-    def test_removing_media_reverts_approved(self):
-        from apps.composer.models import PostMedia
-
-        pm = PostMedia.objects.create(post=self.post, media_asset=self._image_asset(), position=0)
-        url = reverse(
-            "composer:remove_media",
-            kwargs={"workspace_id": self.ws.id, "post_id": self.post.id, "media_id": pm.id},
-        )
-        resp = self.client.post(url)
-        self.assertIn(resp.status_code, (200, 204))
-        self.assertEqual(self.post.platform_posts.get().status, "pending_review")
-
-
-class ApprovalTabChannelFilterTests(ApprovalWorkflowBase):
-    """The approvals tab's channel + status filters must match the SAME child row.
-
-    A post with an Instagram child pending review and a LinkedIn child in draft
-    must NOT surface (or be bulk-actionable) under a LinkedIn + pending_review
-    filter — otherwise actions target a channel that isn't actually pending.
-    """
-
-    def setUp(self):
-        super().setUp()
-        self.other = SocialAccount.objects.create(
-            workspace=self.ws,
-            platform="instagram_business",
-            account_platform_id="ig-1",
-            account_name="IG",
-            connection_status="connected",
-        )
-        self.post = Post.objects.create(workspace=self.ws, author=self.author, title="MIXEDROW", caption="c")
-        PlatformPost.objects.create(post=self.post, social_account=self.other, status="pending_review")  # IG pending
-        PlatformPost.objects.create(post=self.post, social_account=self.account, status="draft")  # LinkedIn draft
-        self.client.force_login(self.reviewer)
-        self.url = reverse("calendar:publish_tab_approvals", kwargs={"workspace_id": self.ws.id})
-
-    def test_channel_filter_hides_row_pending_on_other_channel(self):
-        resp = self.client.get(self.url, {"approval_status": "pending_review", "channel": str(self.account.id)})
-        self.assertEqual(resp.status_code, 200)
-        self.assertNotContains(resp, "MIXEDROW")
-
-    def test_channel_filter_surfaces_row_pending_on_that_channel(self):
-        resp = self.client.get(self.url, {"approval_status": "pending_review", "channel": str(self.other.id)})
-        self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, "MIXEDROW")
 
 
 class PortalMixedPostActionTests(TestCase):

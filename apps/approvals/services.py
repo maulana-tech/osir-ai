@@ -10,7 +10,9 @@ For the bundled case the resulting :class:`ApprovalAction` row stores
 the audit trail remembers exactly which target was acted on.
 """
 
+import difflib
 import logging
+import re
 
 from django.db import transaction
 
@@ -425,3 +427,41 @@ def _notify_clients(post, workspace):
                 "workspace_id": str(workspace.id),
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Version diff
+# ---------------------------------------------------------------------------
+
+
+def _word_diff(old_str, new_str):
+    """Word-level diff tokens for caption changes.
+
+    Returns a list of ``{"t": text, "k": "same"|"add"|"del"}`` so the UI can
+    render additions/removals inline. Tokens keep their surrounding whitespace
+    so the rendered text reads naturally.
+    """
+    a = re.split(r"(\s+)", old_str or "")
+    b = re.split(r"(\s+)", new_str or "")
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            out.append({"t": "".join(a[i1:i2]), "k": "same"})
+            continue
+        if i1 != i2:
+            out.append({"t": "".join(a[i1:i2]), "k": "del"})
+        if j1 != j2:
+            out.append({"t": "".join(b[j1:j2]), "k": "add"})
+    return out
+
+
+def build_diff(old_snapshot, new_snapshot):
+    """Build a structured diff between two version snapshots."""
+    return {
+        "caption_changed": old_snapshot.get("caption", "") != new_snapshot.get("caption", ""),
+        "caption_diff": _word_diff(old_snapshot.get("caption", ""), new_snapshot.get("caption", "")),
+        "media_changed": old_snapshot.get("media", []) != new_snapshot.get("media", []),
+        "media_old": old_snapshot.get("media", []),
+        "media_new": new_snapshot.get("media", []),
+        "platforms_changed": old_snapshot.get("platform_posts", []) != new_snapshot.get("platform_posts", []),
+    }
