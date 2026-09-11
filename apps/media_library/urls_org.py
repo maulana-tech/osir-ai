@@ -1,17 +1,16 @@
 from django.urls import path
 
+from apps.common.console import console
+
 from . import views
 
 app_name = "media_library_org"
 
+# The shared library pages are rendered by the Next.js console; these names stay
+# for ``reverse()``. Mutations and searches go through ``/api/web/org/media``.
 urlpatterns = [
-    path("shared/", views.shared_library_index, name="shared_index"),
-    path("shared/upload/", views.shared_upload, name="shared_upload"),
-    path("shared/tags/autocomplete/", views.shared_tag_autocomplete, name="shared_tag_autocomplete"),
-    path("shared/<uuid:asset_id>/", views.shared_asset_detail, name="shared_asset_detail"),
-    path("shared/<uuid:asset_id>/edit/", views.shared_asset_edit, name="shared_asset_edit"),
-    path("shared/<uuid:asset_id>/delete/", views.shared_asset_delete, name="shared_asset_delete"),
-    path("shared/<uuid:asset_id>/tags/", views.shared_asset_update_tags, name="shared_asset_tags"),
+    path("shared/", console("/org/media"), name="shared_index"),
+    path("shared/<uuid:asset_id>/", console("/org/media?open={asset_id}"), name="shared_asset_detail"),
+    path("shared/<uuid:asset_id>/edit/", console("/org/media/{asset_id}/edit"), name="shared_asset_edit"),
     path("shared/<uuid:asset_id>/download/", views.shared_asset_download, name="shared_asset_download"),
-    path("shared/<uuid:asset_id>/versions/", views.shared_version_list, name="shared_version_list"),
 ]

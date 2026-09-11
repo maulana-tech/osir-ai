@@ -1,9 +1,5 @@
 """Tests for the Media Library app."""
 
-import re
-import uuid
-
-from django.template.loader import render_to_string
 from django.test import SimpleTestCase, TestCase
 
 from apps.common.templatetags.common_extras import json_attr
@@ -80,47 +76,6 @@ class JsonAttrFilterTest(SimpleTestCase):
         self.assertIn("&quot;a&quot;: 1", out)
         self.assertIn("&quot;b&quot;: &quot;x&quot;", out)
         self.assertNotIn('"a"', out)
-
-
-class _StubAsset:
-    def __init__(self, asset_id, tags, is_shared=False):
-        self.id = asset_id
-        self.tags = tags
-        self.is_shared = is_shared
-
-
-class _StubWorkspace:
-    def __init__(self, workspace_id):
-        self.id = workspace_id
-
-
-class TagInputTemplateTest(SimpleTestCase):
-    """Regression: malicious tag content must not break out of the x-data attribute."""
-
-    def _render(self, tags):
-        return render_to_string(
-            "media_library/_tag_input.html",
-            {
-                "asset": _StubAsset(uuid.uuid4(), tags),
-                "workspace": _StubWorkspace(uuid.uuid4()),
-                "is_shared_library": False,
-                "is_admin": False,
-            },
-        )
-
-    def test_malicious_tag_is_escaped_in_x_data(self):
-        rendered = self._render(['"><script>alert(1)</script>'])
-        match = re.search(r'x-data="tagInput\(([^"]*)\)"', rendered)
-        self.assertIsNotNone(match, 'x-data attribute should still be quoted with "')
-        attr_body = match.group(1)
-        self.assertIn("&lt;script&gt;", attr_body)
-        self.assertIn("&quot;", attr_body)
-        self.assertNotIn("<script>", attr_body)
-        self.assertNotIn('"><script>', rendered)
-
-    def test_empty_tags_renders_array_literal(self):
-        rendered = self._render([])
-        self.assertIn('x-data="tagInput([])"', rendered)
 
 
 class NormalizeTagsTest(SimpleTestCase):

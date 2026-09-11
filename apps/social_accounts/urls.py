@@ -1,14 +1,16 @@
 from django.urls import path
 
+from apps.common.console import console
+
 from . import views
 
 app_name = "social_accounts"
 
 urlpatterns = [
-    # Workspace-scoped views
+    # The channels page is rendered by the Next.js console; the name stays for ``reverse()``.
     path(
         "<uuid:workspace_id>/",
-        views.account_list,
+        console("/w/{workspace_id}/channels"),
         name="list",
     ),
     path(
