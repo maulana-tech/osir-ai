@@ -22,8 +22,6 @@ urlpatterns = [
     path("tags/create/", console("/w/{workspace_id}/create"), name="tag_create"),
     path("compose/", console("/w/{workspace_id}/compose"), name="compose"),
     path("compose/<uuid:post_id>/", console("/w/{workspace_id}/compose/{post_id}"), name="compose_edit"),
-    # templates/calendar/partials/_delete_post_modal.html still reverses this.
-    path("compose/<uuid:post_id>/delete/", console("/w/{workspace_id}/compose/{post_id}"), name="post_delete"),
     # Same-origin video bytes for the console's frame picker (proxied through /workspace/).
     path("compose/media-stream/<uuid:asset_id>/", views.media_stream, name="media_stream"),
     path("compose/media-filmstrip/<uuid:asset_id>/", views.media_filmstrip, name="media_filmstrip"),

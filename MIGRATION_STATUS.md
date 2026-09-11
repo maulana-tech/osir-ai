@@ -21,34 +21,23 @@ apa yang **belum** selesai.
 
 ## Belum selesai
 
-### 1. Hapus UI Django lama (template + view)
-Template dan view Django untuk halaman-halaman di atas masih ada di `templates/` dan
-`apps/*/views.py`, tetapi sudah tidak dipakai console. Rencana yang belum dijalankan:
+### 1. Hapus UI Django lama (template + view) — SELESAI
+Template dan view Django untuk halaman yang sudah pindah telah dihapus. URL lamanya
+menjadi redirect `apps.common.console.console(...)` ke halaman console (nama URL tetap
+hidup untuk `reverse()` di email/notifikasi). Yang masih view Django asli: endpoint file
+(`media_library.asset_download`, `shared_asset_download`, `composer.media_stream`,
+`composer.media_filmstrip`), `members.accept_invite`, semua OAuth di `social_accounts`,
+webhooks, client portal, onboarding, auth (allauth). Test lama sudah di-port ke service
+atau ke route `/api/web/` (`apps/webapi/tests/`).
 
-- Ganti view halaman dengan `apps.common.console.console("/w/{workspace_id}/...")` di
-  masing-masing `urls.py` agar nama URL tetap hidup untuk `reverse()` di email/notifikasi,
-  lalu hapus fungsi view dan folder template-nya:
-  `templates/{calendar,composer,media_library,inbox,analytics,members,notifications,approvals,organizations,workspaces,api_keys,settings_manager}`,
-  `templates/accounts/{dashboard,settings}.html`, `templates/social_accounts/list.html`.
-- Hapus endpoint HTMX/JSON yang fungsinya sudah ada di `/api/web/`
-  (kecuali yang masih dipakai console: `composer.media_stream`, `composer.media_filmstrip`,
-  `media_library.asset_download`, `media_library_org.shared_asset_download`,
-  `members.accept_invite`, semua OAuth connect/callback/reconnect di `social_accounts`, webhooks).
-- Putuskan nasib `templates/base.html`, `layouts/`, `components/`, `partials/` dan
-  `apps/common/context_processors.py:sidebar_context` (hanya perlu jika masih ada template
-  yang meng-extend `base.html`).
-- `/` (dashboard Django) → redirect ke `/w/<last_workspace_id>/calendar`.
-- ~82 test yang bergantung pada halaman lama harus di-port ke service atau ke route
-  `/api/web/` (lihat `apps/webapi/tests/`), bukan sekadar dihapus. Daftar file:
-  `apps/api_keys/tests/test_views.py`, `apps/analytics/tests/test_views.py`,
-  `apps/calendar/test_bulk_actions.py`, `apps/calendar/tests.py`,
-  `apps/members/tests/test_role_hierarchy.py`, `apps/inbox/tests/test_send_reply.py`,
-  `apps/approvals/test_workflow.py`, `apps/approvals/test_security.py`,
-  `apps/notifications/tests.py`, `apps/media_library/tests/*`,
-  `apps/composer/tests/{test_account_scope,test_proposed_publish_at,test_save_post_tags,test_idea_media_flows,test_unsplash,test_template_picker,test_csv_upload_size,test_preview}.py`,
-  `apps/api/tests/test_review_fixes_round2.py`.
-- Setelah itu kecilkan daftar path yang diproksi ke Django di `web/next.config.ts`
-  (`DJANGO_PATHS`) dan `Caddyfile` (`@django`).
+Sisa yang masih bisa dirapikan:
+- `templates/base.html`, `layouts/`, `components/`, `partials/`, `social_accounts/partials/`
+  masih dipakai halaman auth/OAuth/onboarding, jadi dipertahankan. Bisa disederhanakan
+  (sidebar lama, `sidebar_context`) kalau halaman-halaman itu ikut dipindah ke console.
+- Daftar path yang diproksi ke Django di `web/next.config.ts` (`DJANGO_PATHS`) dan
+  `Caddyfile` (`@django`) sengaja masih memuat `/workspace/`, `/organizations/media/`,
+  `/members/`, `/workspaces/`, `/notifications/` dll. karena Django yang mengalihkan URL
+  lama itu ke console; boleh dikecilkan kalau redirect lama tidak diperlukan lagi.
 
 ### 2. Halaman yang sengaja masih Django
 Login/signup/2FA/reset password (allauth), OAuth connect + callback, client portal,
@@ -68,5 +57,4 @@ di browser dengan akun asli (login tidak bisa diotomasi). Cek terutama: composer
 (simpan/schedule/queue), media editor, kanban drag-and-drop, calendar selection bar.
 
 ### 5. Dokumen
-`CLAUDE.md` bagian "What this is" masih menyebut "Server-rendered templates + HTMX" —
-perbarui setelah UI Django dihapus. `README.md` bagian docker/prod sudah diperbarui.
+`CLAUDE.md`, `README.md` dan `web/README.md` sudah menggambarkan console sebagai UI utama.

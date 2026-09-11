@@ -60,7 +60,6 @@ urlpatterns = [
         name="oauth-protected-resource-metadata-mcp",
     ),
     # Approval Workflow (Stream F)
-    path("workspace/<uuid:workspace_id>/", include("apps.approvals.urls")),
     # Client Portal Admin (workspace settings)
     path("workspace/<uuid:workspace_id>/settings/clients/", include("apps.client_portal.urls_admin")),
     # Media Library

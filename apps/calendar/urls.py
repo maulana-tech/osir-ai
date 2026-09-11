@@ -2,9 +2,7 @@
 
 The templates and views are gone (the console at ``web/`` renders these pages
 and talks to ``apps/webapi``); the URL names survive so ``reverse()`` and
-``{% url %}`` in the remaining server-rendered code keep working. The slot
-mutation names stay only because ``templates/social_accounts/partials/
-_posting_slots_grid.html`` still reverses them.
+``{% url %}`` in the remaining server-rendered code keep working.
 """
 
 from django.urls import path
@@ -23,11 +21,6 @@ urlpatterns = [
     path("publish/approvals/", console(f"{_CAL}?view=list&tab=approvals"), name="publish_tab_approvals"),
     path("publish/sent/", console(f"{_CAL}?view=list&tab=sent"), name="publish_tab_sent"),
     path("posting-slots/", console(_SLOTS), name="posting_slots"),
-    path("posting-slots/save/", console(_SLOTS), name="save_posting_slot"),
-    path("posting-slots/grid/", console(_SLOTS), name="account_slots_partial"),
-    path("posting-slots/toggle-day/", console(_SLOTS), name="toggle_posting_slot_day"),
-    path("posting-slots/<uuid:slot_id>/delete/", console(_SLOTS), name="delete_posting_slot"),
-    path("posting-slots/<uuid:slot_id>/update/", console(_SLOTS), name="update_posting_slot"),
     path("queues/", console(f"{_CAL}/queues"), name="queue_list"),
     path("queues/<uuid:queue_id>/", console(f"{_CAL}/queues/{{queue_id}}"), name="queue_detail"),
 ]

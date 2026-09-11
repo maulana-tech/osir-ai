@@ -5,6 +5,8 @@ exclusion from the publish path, two-stage review, and re-review after edits.
 The HTTP contract lives in ``apps/webapi/tests/test_approvals.py``.
 """
 
+import json
+
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -305,6 +307,7 @@ class ApprovedEditReReviewTests(ApprovalWorkflowBase):
         PostMedia.objects.create(post=self.post, media_asset=self._image_asset(), position=0)
         self._save(media_asset_ids=[])
         self.assertEqual(self._status(), "pending_review")
+
 
 class PortalMixedPostActionTests(TestCase):
     """A pending_client child must expose client actions even when a lower-ranked
