@@ -11,7 +11,6 @@ from ninja.errors import HttpError
 from apps.approvals import comments as comment_service
 from apps.approvals import services
 from apps.approvals.models import PostComment
-from apps.approvals.views import _build_diff
 from apps.composer.models import Post, PostVersion
 from apps.webapi.common import require_perm, scoped
 
@@ -188,5 +187,5 @@ def versions(request, workspace_id: uuid.UUID, post_id: uuid.UUID, v1: int | Non
         ],
         "old": old.version_number if old else None,
         "new": new.version_number if new else None,
-        "diff": _build_diff(old.snapshot if old else {}, new.snapshot if new else {}),
+        "diff": services.build_diff(old.snapshot if old else {}, new.snapshot if new else {}),
     }
