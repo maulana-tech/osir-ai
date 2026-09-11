@@ -64,6 +64,10 @@ class TestWorkspaceSettings:
             r.status_code == 200 and r.json()["name"] == "Renamed" and r.json()["effective_timezone"] == "Asia/Jakarta"
         )
         assert _send(member_client, "patch", base, {"timezone": "Mars/Olympus"}).status_code == 400
+        assert _send(member_client, "patch", base, {"agent_autonomy": "bogus"}).status_code == 400
+        assert _send(member_client, "patch", base, {"approval_workflow_mode": "bogus"}).status_code == 400
+        workspace.refresh_from_db()
+        assert workspace.agent_autonomy == "autopilot"
         assert _send(member_client, "post", f"{base}/archive").status_code == 200
         workspace.refresh_from_db()
         assert workspace.is_archived is True
@@ -211,3 +215,23 @@ class TestAccountAndNotifications:
         assert body["unread_count"] == 1 and body["notifications"][0]["id"] == str(n.id)
         _send(member_client, "post", f"/api/web/me/notifications/{n.id}/read")
         assert member_client.get("/api/web/me/notifications?read_status=unread").json()["notifications"] == []
+        Notification.objects.create(user=org_owner, event_type="post_failed", title="Failed")
+        assert _send(member_client, "post", "/api/web/me/notifications/read-all").json()["marked"] == 1
+        assert member_client.get("/api/web/me/notifications").json()["unread_count"] == 0
+
+    def test_notifications_filter_by_event_type(self, member_client, org_owner):
+        from apps.notifications.models import Notification
+
+        Notification.objects.create(user=org_owner, event_type="post_approved", title="Approved")
+        Notification.objects.create(user=org_owner, event_type="post_failed", title="Failed")
+        body = member_client.get("/api/web/me/notifications?event_type=post_approved").json()
+        assert [n["title"] for n in body["notifications"]] == ["Approved"] and body["total"] == 1
+        assert {e["value"] for e in body["event_types"]} >= {"post_approved", "post_failed"}
+
+    def test_notification_preferences_matrix_covers_every_event_and_channel(self, member_client):
+        from apps.notifications.models import Channel, EventType
+
+        body = member_client.get("/api/web/me/notification-preferences").json()
+        assert {m["event_type"] for m in body["matrix"]} == set(EventType.values)
+        assert all({c["channel"] for c in m["channels"]} == set(Channel.values) for m in body["matrix"])
+        assert body["quiet_hours"]["timezone"]

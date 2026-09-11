@@ -1,9 +1,9 @@
 from django.urls import path
 
-from . import views
+from apps.common.console import console
 
 app_name = "settings_manager"
 
 urlpatterns = [
-    path("", views.settings_index, name="index"),
+    path("", console("/me/account"), name="index"),
 ]
